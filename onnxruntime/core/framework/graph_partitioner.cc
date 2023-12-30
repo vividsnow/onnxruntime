@@ -17,6 +17,7 @@
 #include "core/graph/graph_viewer.h"
 #include "core/graph/model.h"
 #include "core/session/onnxruntime_session_options_config_keys.h"
+#include <filesystem>
 
 // uncomment this line to count non-CUDA ops in ONNX domain
 // #define COUNT_NON_CUDA_OPS
