@@ -123,6 +123,14 @@ ONNX_TYPE_TO_NP_TYPE = {
     onnx_proto.TensorProto.FLOAT8E4M3FN: float8e4m3fn,
 }
 
+NP_TYPE_TO_ONNX_TYPE = {
+    numpy.dtype("int8"): onnx_proto.TensorProto.INT8,
+    numpy.dtype("uint8"): onnx_proto.TensorProto.UINT8,
+    numpy.dtype("int16"): onnx_proto.TensorProto.INT16,
+    numpy.dtype("uint16"): onnx_proto.TensorProto.UINT16,
+    float8e4m3fn: onnx_proto.TensorProto.FLOAT8E4M3FN,
+}
+
 ONNX_INT_TYPE_RANGE = {
     onnx_proto.TensorProto.UINT8: (numpy.array(0, dtype=numpy.uint8), numpy.array(255, dtype=numpy.uint8)),
     onnx_proto.TensorProto.INT8: (numpy.array(-128, dtype=numpy.int8), numpy.array(127, dtype=numpy.int8)),

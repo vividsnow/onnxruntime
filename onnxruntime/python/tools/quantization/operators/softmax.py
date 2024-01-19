@@ -28,11 +28,17 @@ class QLinearSoftmax(QuantOperatorBase):
         # only try to quantize when given quantization parameters for it
         (
             data_found,
+            qparam_infos,
+        ) = self.quantizer._get_quantization_params(node.output[0], out_scale, out_zero_point)
+
+        (
             output_scale_name,
             output_zp_name,
             _,
             _,
-        ) = self.quantizer._get_quantization_params(node.output[0], out_scale, out_zero_point)
+        ) = (
+            qparam_infos[0] if data_found else (None, None, None, None)
+        )
 
         # get quantized input tensor names, quantize input if needed
         (
@@ -90,21 +96,39 @@ class QDQSoftmax(QDQOperatorBase):
         output_name = self.node.output[0]
         quant_overrides = self.quantizer.get_per_tensor_quant_overrides(output_name)
 
-        quant_type = self.quantizer.activation_qType
+        quant_types = [self.quantizer.activation_qType]
         if "quant_type" in quant_overrides:
-            quant_type = quant_overrides["quant_type"].tensor_type
+            if isinstance(quant_overrides["quant_type"], list):
+                quant_types = [qt.tensor_type for qt in quant_overrides["quant_type"]]
+            else:
+                quant_types = [quant_overrides["quant_type"].tensor_type]
 
         if "scale" in quant_overrides and "zero_point" in quant_overrides:
-            out_zero_point, out_scale = quant_overrides["zero_point"], quant_overrides["scale"]
+            if isinstance(quant_overrides["scale"], list):
+                zeros, scales = quant_overrides["zero_point"], quant_overrides["scale"]
+            else:
+                zeros = [quant_overrides["zero_point"]]
+                scales = [quant_overrides["scale"]]
         else:
             # Unless overridden by the user, force Softmax to range from 0.0 to 1.0
-            qparams = self.quantizer.quantization_params[output_name]
-            dtype = qparams.data["scale"].dtype
-            rmin = quant_overrides.get("rmin", np.array(0, dtype=dtype))
-            rmax = quant_overrides.get("rmax", np.array(1, dtype=dtype))
-            symmetric = quant_overrides.get("symmetric", self.quantizer.is_activation_symmetric)
-            reduce_range = quant_overrides.get("reduce_range", False)
-            qmin, qmax = get_qmin_qmax_for_qType(quant_type, reduce_range=reduce_range, symmetric=symmetric)
-            out_zero_point, out_scale = compute_scale_zp(rmin, rmax, qmin, qmax, symmetric=symmetric)
+            qparam_infos = self.quantizer.quantization_params[output_name]
+            assert len(qparam_infos) == len(quant_types)
 
-        self.quantizer.set_quant_scale_zp(output_name, (out_scale, out_zero_point))
+            zeros = []
+            scales = []
+
+            for i in range(len(quant_types)):
+                qparams = qparam_infos[i]
+                quant_type = quant_types[i]
+
+                dtype = qparams.data["scale"].dtype
+                rmin = quant_overrides.get("rmin", np.array(0, dtype=dtype))
+                rmax = quant_overrides.get("rmax", np.array(1, dtype=dtype))
+                symmetric = quant_overrides.get("symmetric", self.quantizer.is_activation_symmetric)
+                reduce_range = quant_overrides.get("reduce_range", False)
+                qmin, qmax = get_qmin_qmax_for_qType(quant_type, reduce_range=reduce_range, symmetric=symmetric)
+                out_zero_point, out_scale = compute_scale_zp(rmin, rmax, qmin, qmax, symmetric=symmetric)
+                zeros.append(out_zero_point)
+                scales.append(out_scale)
+
+        self.quantizer.set_quant_scale_zp(output_name, (scales, zeros))

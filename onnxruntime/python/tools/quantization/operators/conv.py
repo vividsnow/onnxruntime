@@ -142,13 +142,16 @@ class QLinearConv(QuantOperatorBase):
         node = self.node
         assert node.op_type == "Conv"
 
+        (data_found, qparam_infos) = self.quantizer._get_quantization_params(node.output[0])
+        if not data_found:
+            return super().quantize()
+
         (
-            data_found,
             output_scale_name,
             output_zp_name,
             _,
             _,
-        ) = self.quantizer._get_quantization_params(node.output[0])
+        ) = qparam_infos[0]
 
         if self.quantizer.is_input_a_initializer(node.input[1]) and self.quantizer.is_per_channel():
             (

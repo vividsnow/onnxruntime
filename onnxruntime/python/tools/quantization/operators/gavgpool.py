@@ -20,13 +20,17 @@ class QGlobalAveragePool(QuantOperatorBase):
 
         # Create an entry for output quantized value.
         quantized_input_value = self.quantizer.quantized_value_map[node.input[0]]
+        (data_found, qparam_infos) = self.quantizer._get_quantization_params(node.output[0])
+
         (
-            data_found,
             output_scale_name_from_parameter,
             output_zp_name_from_parameter,
             _,
             _,
-        ) = self.quantizer._get_quantization_params(node.output[0])
+        ) = (
+            qparam_infos[0] if data_found else (None, None, None, None)
+        )
+
         # Just use input scale and zp if parameters for output is not specified.
         output_scale_name = output_scale_name_from_parameter if data_found else quantized_input_value.scale_name
         output_zp_name = output_zp_name_from_parameter if data_found else quantized_input_value.zp_name

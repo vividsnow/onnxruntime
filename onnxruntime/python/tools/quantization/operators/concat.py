@@ -18,20 +18,24 @@ class QLinearConcat(QuantOperatorBase):
     def quantize(self):
         node = self.node
 
+        (data_found, qparam_infos) = self.quantizer._get_quantization_params(node.output[0])
+
+        if not data_found:
+            return super().quantize()
+
         (
-            data_found,
             output_scale_name,
             output_zp_name,
             _,
             _,
-        ) = self.quantizer._get_quantization_params(node.output[0])
+        ) = qparam_infos[0]
         (
             q_input_names,
             zero_point_names,
             scale_names,
             nodes,
         ) = self.quantizer.quantize_activation(node, [*range(0, len(node.input))])
-        if not data_found or q_input_names is None:
+        if q_input_names is None:
             return super().quantize()
 
         # Create an entry for output quantized value
