@@ -6,10 +6,13 @@
 #include <iostream>
 #include "QnnOpDef.h"
 
+#include "core/graph/graph_utils.h"
+#include "core/optimizer/qdq_transformer/qdq_util.h"
 #include "core/providers/qnn/builder/op_builder_factory.h"
 #include "core/providers/shared/utils/utils.h"
 #include "core/framework/utils.h"
 #include "core/providers/qnn/builder/qnn_utils.h"
+#include "core/providers/qnn/builder/opbuilder/base_op_builder.h"
 
 namespace onnxruntime {
 namespace qnn {
@@ -113,6 +116,59 @@ Status QnnModel::ComposeGraph(const GraphViewer& graph_viewer,
     return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Failed to initialize qnn_model_wrapper.");
   }
 
+  auto get_const_initializer = [&graph_viewer](const std::string& initializer_name) {
+    return graph_viewer.GetConstantInitializer(initializer_name, true);
+  };
+
+  std::unordered_set<const NodeUnit*> handled_node_units;
+
+  auto handle_dq_q_sequence = [&](const NodeUnit& node_unit) -> bool {
+    // Looking for a standalone DQ to start the sequence.
+    if (node_unit.OpType() != QDQ::DQOpName || node_unit.UnitType() != NodeUnit::Type::SingleNode) {
+      return false;
+    }
+
+    const Node& dq_node = node_unit.GetNode();
+
+    // Must have a single Q child.
+    auto children = graph_utils::FindChildrenByType(dq_node, QDQ::QOpName);
+    if (children.size() != 1 || dq_node.GetOutputEdgesCount() != 1 || graph_viewer.NodeProducesGraphOutput(dq_node)) {
+      return false;
+    }
+
+    const Node& q_node = *children[0];
+    const NodeUnit& q_node_unit = GetNodeUnit(&q_node, node_unit_map);
+
+    // Q child must not already be part of a QDQ NodeUnit (i.e., be standalone).
+    if (q_node_unit.UnitType() != NodeUnit::Type::SingleNode) {
+      return false;
+    }
+
+    assert(handled_node_units.count(&q_node_unit) == 0);
+
+    // DQ and Q must have equal scale type and different zp type.
+    if (!QDQ::IsDQQConversion(q_node, dq_node, get_const_initializer, graph_viewer.ModelPath())) {
+      return false;
+    }
+
+    const auto* op_builder = reinterpret_cast<const qnn::ConvertOpBuilder*>(GetOpBuilder("Convert"));
+    assert(op_builder);
+
+    LOGS(logger_, VERBOSE) << " Adding QNN Convert. dq_node name: [" << dq_node.Name()
+                           << "] dq_node optype: [" << dq_node.OpType()
+                           << "] q_node name: [" << q_node_unit.Name()
+                           << "] q_node optype: [" << q_node_unit.OpType()
+                           << "]";
+    auto status = op_builder->AddConvertToModelBuilder(qnn_model_wrapper, node_unit, q_node_unit, logger_, false);
+    assert(status.IsOK());
+
+    // Add DQ and Q to the handled set.
+    handled_node_units.insert(&node_unit);
+    handled_node_units.insert(&q_node_unit);
+
+    return true;
+  };
+
   // Op builer
   const auto& node_indices = graph_viewer.GetNodesInTopologicalOrder();
   for (size_t i = 0; i < node_indices.size(); i++) {
@@ -123,18 +179,31 @@ Status QnnModel::ComposeGraph(const GraphViewer& graph_viewer,
     // Q, DQ nodes in the node unit only carry the quantization parameters
     // Add the QNN node when it is the target node (It's a normal node or a singel Q/DQ node)
     const std::string& op_type = node_unit.OpType();
+    if (node != &node_unit.GetNode()) {
+      continue;
+    }
+
+    if (handled_node_units.count(&node_unit) != 0) {
+      continue;  // Already handled.
+    }
+
+    // Treat DQ -> Q sequence into QNN Convert op
+#if 1
+    if (handle_dq_q_sequence(node_unit)) {
+      continue;
+    }
+#endif
+
     LOGS(logger_, VERBOSE) << " node name: [" << node->Name()
                            << "] node optype: [" << op_type
                            << "] as part of the NodeUnit type: [" << node_unit.OpType()
                            << "] name: [" << node_unit.Name()
                            << "]";
-    if (node != &node_unit.GetNode()) {
-      continue;
-    }
-
     if (const auto* op_builder = GetOpBuilder(op_type)) {
       ORT_RETURN_IF_ERROR(op_builder->AddToModelBuilder(qnn_model_wrapper, node_unit, logger_));
     }
+
+    handled_node_units.insert(&node_unit);
   }
 
   ORT_RETURN_IF_NOT(qnn_model_wrapper.ComposeQnnGraph(), "Failed to compose Qnn graph.");
@@ -157,7 +226,7 @@ Status QnnModel::FinalizeGraphs() {
     return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Failed to finalize QNN graph.");
   }
 
-  ORT_RETURN_IF_ERROR(qnn_backend_manager_->ExtractBackendProfilingInfo());
+  // ORT_RETURN_IF_ERROR(qnn_backend_manager_->ExtractBackendProfilingInfo());
 
   LOGS(logger_, VERBOSE) << "FinalizeGraphs completed.";
   return Status::OK();

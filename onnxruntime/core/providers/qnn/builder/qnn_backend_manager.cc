@@ -879,6 +879,7 @@ Status QnnBackendManager::ExtractBackendProfilingInfo() {
     LOGS(*logger_, VERBOSE) << "profile_events: " << profile_events << " num_events: " << num_events;
 
     bool backendSupportsExtendedEventData = false;
+    /*
     Qnn_ErrorHandle_t resultPropertyHasCapability =
         qnn_interface_.propertyHasCapability(QNN_PROPERTY_PROFILE_SUPPORTS_EXTENDED_EVENT);
     uint16_t errorCodePropertyHasCapability = static_cast<uint16_t>(resultPropertyHasCapability & 0xFFFF);
@@ -888,16 +889,17 @@ Status QnnBackendManager::ExtractBackendProfilingInfo() {
     } else {
       LOGS(*logger_, VERBOSE) << "The QNN backend does not support extended event data.";
     }
+    */
 
     bool tracelogging_provider_ep_enabled = false;
-    const Env& env = Env::Default();
-    auto& provider = env.GetTelemetryProvider();
-    if (provider.IsEnabled()) {
-      auto keyword = provider.Keyword();
-      if ((keyword & static_cast<uint64_t>(onnxruntime::logging::ORTTraceLoggingKeyword::Profiling)) != 0) {
-        tracelogging_provider_ep_enabled = true;
-      }
-    }
+    //const Env& env = Env::Default();
+    //auto& provider = env.GetTelemetryProvider();
+    //if (provider.IsEnabled()) {
+      //auto keyword = provider.Keyword();
+      //if ((keyword & static_cast<uint64_t>(onnxruntime::logging::ORTTraceLoggingKeyword::Profiling)) != 0) {
+        //tracelogging_provider_ep_enabled = true;
+      //}
+    //}
     std::ofstream outfile;
     if (!tracelogging_provider_ep_enabled) {
       // Write to CSV in append mode

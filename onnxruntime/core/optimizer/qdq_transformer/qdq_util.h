@@ -38,6 +38,11 @@ bool IsQDQPairSupported(
     const GetConstantInitializerFn& get_const_initializer,
     const Path& model_path);
 
+bool IsDQQConversion(
+    const Node& q_node, const Node& dq_node,
+    const GetConstantInitializerFn& get_const_initializer,
+    const Path& model_path);
+
 // Check if DQ is supported in extended level QDQ transformers. It requires:
 // 1. DQ doesn't have optional input.
 // 2. scale and zero point is constant scalar
