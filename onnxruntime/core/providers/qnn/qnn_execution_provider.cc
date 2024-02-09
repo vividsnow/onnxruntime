@@ -166,8 +166,9 @@ QNNExecutionProvider::QNNExecutionProvider(const ProviderOptions& provider_optio
 
   static const std::string PROFILING_LEVEL = "profiling_level";
   qnn::ProfilingLevel profiling_level = qnn::ProfilingLevel::OFF;
-  const Env& env = Env::Default();
-  auto& provider = env.GetTelemetryProvider();
+  //const Env& env = Env::Default();
+  //auto& provider = env.GetTelemetryProvider();
+  /*
   if (provider.IsEnabled()) {
     auto level = provider.Level();
     auto keyword = provider.Keyword();
@@ -186,11 +187,12 @@ QNNExecutionProvider::QNNExecutionProvider(const ProviderOptions& provider_optio
       }
     }
   } else {
+*/
     auto profiling_level_pos = provider_options_map.find(PROFILING_LEVEL);
     if (profiling_level_pos != provider_options_map.end()) {
       ParseProfilingLevel(profiling_level_pos->second, profiling_level);
     }
-  }
+  //}
 
   static const std::string RPC_CONTROL_LANTENCY = "rpc_control_latency";
   uint32_t rpc_control_latency = 0;
