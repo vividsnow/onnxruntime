@@ -12,7 +12,9 @@ from typing import Dict, Tuple, Union
 
 import numpy as np
 import torch
+from packaging import version
 from transformers import WhisperConfig, WhisperForConditionalGeneration, WhisperProcessor
+from transformers import __version__ as transformers_version
 from whisper_decoder import WhisperDecoder, WhisperDecoderHelper, WhisperDecoderInit
 from whisper_encoder import WhisperEncoder, WhisperEncoderHelper
 from whisper_encoder_decoder_init import WhisperEncoderDecoderInit, WhisperEncoderDecoderInitHelper
@@ -20,9 +22,9 @@ from whisper_encoder_decoder_init import WhisperEncoderDecoderInit, WhisperEncod
 from onnxruntime import InferenceSession
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
-from float16 import float_to_float16_max_diff  # noqa: E402
-from onnx_model import OnnxModel  # noqa: E402
-from optimizer import optimize_model  # noqa: E402
+from float16 import float_to_float16_max_diff
+from onnx_model import OnnxModel
+from optimizer import optimize_model
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +90,10 @@ class WhisperHelper:
         Returns:
             Dict[str, torch.nn.Module]: mapping from name to modules for ONNX conversion.
         """
-        model = WhisperForConditionalGeneration.from_pretrained(model_name_or_path, cache_dir=cache_dir)
+        extra_kwargs = {}
+        if version.parse(transformers_version) >= version.parse("4.36.0"):
+            extra_kwargs["attn_implementation"] = "eager"
+        model = WhisperForConditionalGeneration.from_pretrained(model_name_or_path, cache_dir=cache_dir, **extra_kwargs)
         if state_dict_path:
             model.load_state_dict(torch.load(state_dict_path), strict=False)
 
@@ -262,11 +267,17 @@ class WhisperHelper:
     @staticmethod
     def verify_onnx(
         model_name_or_path: str,
+        cache_dir: str,
         ort_session: InferenceSession,
         device: torch.device,
     ):
         """Compare the result from PyTorch and ONNX Runtime to verify the ONNX model is good."""
-        pt_model = WhisperForConditionalGeneration.from_pretrained(model_name_or_path).to(device)
+        extra_kwargs = {}
+        if version.parse(transformers_version) >= version.parse("4.36.0"):
+            extra_kwargs["attn_implementation"] = "eager"
+        pt_model = WhisperForConditionalGeneration.from_pretrained(
+            model_name_or_path, cache_dir=cache_dir, **extra_kwargs
+        ).to(device)
         processor = WhisperProcessor.from_pretrained(model_name_or_path)
         config = WhisperConfig.from_pretrained(model_name_or_path)
 
@@ -279,7 +290,7 @@ class WhisperHelper:
             logger.warning(f"Could not import `datasets`. Attempting to install `datasets` via `{install_cmd}`.")
             os.system(install_cmd)
 
-        from datasets import load_dataset  # noqa: F811
+        from datasets import load_dataset
 
         ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
         input_features = processor([ds[0]["audio"]["array"]], return_tensors="pt").input_features
