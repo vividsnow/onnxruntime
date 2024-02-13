@@ -899,13 +899,13 @@ Status QnnBackendManager::ExtractBackendProfilingInfo() {
     */
 
     bool tracelogging_provider_ep_enabled = false;
-    //const Env& env = Env::Default();
-    //auto& provider = env.GetTelemetryProvider();
-    //if (provider.IsEnabled()) {
-      //auto keyword = provider.Keyword();
-      //if ((keyword & static_cast<uint64_t>(onnxruntime::logging::ORTTraceLoggingKeyword::Profiling)) != 0) {
-        //tracelogging_provider_ep_enabled = true;
-      //}
+    // const Env& env = Env::Default();
+    // auto& provider = env.GetTelemetryProvider();
+    // if (provider.IsEnabled()) {
+    // auto keyword = provider.Keyword();
+    // if ((keyword & static_cast<uint64_t>(onnxruntime::logging::ORTTraceLoggingKeyword::Profiling)) != 0) {
+    // tracelogging_provider_ep_enabled = true;
+    //}
     //}
     std::ofstream outfile;
     if (!tracelogging_provider_ep_enabled) {

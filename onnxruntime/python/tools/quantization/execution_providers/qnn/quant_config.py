@@ -4,10 +4,11 @@
 # license information.
 # --------------------------------------------------------------------------
 from __future__ import annotations
+
+import copy
 from dataclasses import dataclass
 from pathlib import Path
 
-import copy
 import numpy as np
 import onnx
 
@@ -32,6 +33,7 @@ def _is_tensor_quantizable(tensor_name, value_infos, name_to_initializer):
 
     return False
 
+
 def _get_output_activation_qtype(tensor_name, tensor_quant_overrides, activation_type):
     if not tensor_name in tensor_quant_overrides:
         return activation_type
@@ -41,6 +43,7 @@ def _get_output_activation_qtype(tensor_name, tensor_quant_overrides, activation
         raise ValueError("Do not yet support per-tensor quantization")
 
     return override_list[0].get("quant_type", activation_type)
+
 
 def _set_weight_type(tensor_quant_overrides, tensor_name, weight_type, weight_symmetric):
     if tensor_name not in tensor_quant_overrides or not tensor_quant_overrides[tensor_name]:
@@ -55,6 +58,7 @@ def _set_weight_type(tensor_quant_overrides, tensor_name, weight_type, weight_sy
     if "quant_type" not in overrides and "symmetric" not in overrides:
         overrides["quant_type"] = weight_type
         overrides["symmetric"] = weight_symmetric
+
 
 def _set_scale_zero_point(tensor_quant_overrides, tensor_name, quant_type, scale, zero_point):
     if tensor_name not in tensor_quant_overrides or not tensor_quant_overrides[tensor_name]:
@@ -71,10 +75,13 @@ def _set_scale_zero_point(tensor_quant_overrides, tensor_name, quant_type, scale
     assert overrides["quant_type"] == quant_type, "Unexpected quant_type when overridding zp/scale"
 
     if set(overrides).intersection({"scale", "zero_point", "symmetric", "reduce_range", "rmin", "rmax"}):
-        print(f"[WARNING]: Need to override zero-point/scale for tensor {tensor_name}, but you've already provided overrides!")
+        print(
+            f"[WARNING]: Need to override zero-point/scale for tensor {tensor_name}, but you've already provided overrides!"
+        )
     else:
         overrides["zero_point"] = zero_point
         overrides["scale"] = scale
+
 
 def _add_to_convert_recv_nodes(tensor_quant_overrides, tensor_name, prod_type, consumer_type, consumer_names):
     if tensor_name not in tensor_quant_overrides or not tensor_quant_overrides[tensor_name]:
@@ -93,6 +100,7 @@ def _add_to_convert_recv_nodes(tensor_quant_overrides, tensor_name, prod_type, c
 
     convert_dict["recv_nodes"].update(consumer_names)
 
+
 def _check_not_in_convert_recv_nodes(tensor_quant_overrides, tensor_name, consumer_names):
     if tensor_name not in tensor_quant_overrides or not tensor_quant_overrides[tensor_name]:
         return True
@@ -108,6 +116,7 @@ def _check_not_in_convert_recv_nodes(tensor_quant_overrides, tensor_name, consum
         return True
 
     return not convert_dict["recv_nodes"].intersection(consumer_names)
+
 
 def _get_input_activation_qtype(tensor_quant_overrides, input_name, node_name, activation_type):
     if input_name not in tensor_quant_overrides or not tensor_quant_overrides[input_name]:
@@ -127,24 +136,28 @@ def _get_input_activation_qtype(tensor_quant_overrides, input_name, node_name, a
     # Only specific consumers get the converted quant_type
     return convert_dict["quant_type"] if node_name in overrides["convert"]["recv_nodes"] else producer_type
 
+
 @dataclass
 class TensorTypeRequest:
-    producer_type: QuantType|None
-    consumers: tuple[QuantType, set[str]]|None
+    producer_type: QuantType | None
+    consumers: tuple[QuantType, set[str]] | None
 
-def _add_qtype_converts(tensor_quant_overrides, activation_type, value_infos, name_to_initializer, producers, consumers):
+
+def _add_qtype_converts(
+    tensor_quant_overrides, activation_type, value_infos, name_to_initializer, producers, consumers
+):
     type_requests = {}
 
     # Scan tensor overrides for type conversion requests.
     for tensor_name, override_list in tensor_quant_overrides.items():
         if not _is_tensor_quantizable(tensor_name, value_infos, name_to_initializer):
-            continue # Skip non-quantizable tensors (e.g., not a float)
+            continue  # Skip non-quantizable tensors (e.g., not a float)
 
         if tensor_name in name_to_initializer:
-            continue # Skip initializers
+            continue  # Skip initializers
 
         if not override_list or len(override_list) > 1:
-            continue # Skip per-channel stuff
+            continue  # Skip per-channel stuff
 
         override = override_list[0]
         quant_type = override.get("quant_type", activation_type)
@@ -162,7 +175,11 @@ def _add_qtype_converts(tensor_quant_overrides, activation_type, value_infos, na
 
             # Add the consumer side of the type request
             for input_name in node.input:
-                if input_name and input_name not in name_to_initializer and _is_tensor_quantizable(input_name, value_infos, name_to_initializer):
+                if (
+                    input_name
+                    and input_name not in name_to_initializer
+                    and _is_tensor_quantizable(input_name, value_infos, name_to_initializer)
+                ):
                     if input_name not in type_requests:
                         type_requests[input_name] = TensorTypeRequest(None, None)
 
@@ -185,17 +202,23 @@ def _add_qtype_converts(tensor_quant_overrides, activation_type, value_infos, na
             consumer_type = type_req.consumers[0]
 
             if prod_type != consumer_type:
-                _add_to_convert_recv_nodes(tensor_quant_overrides, tensor_name, prod_type, consumer_type, type_req.consumers[1])
+                _add_to_convert_recv_nodes(
+                    tensor_quant_overrides, tensor_name, prod_type, consumer_type, type_req.consumers[1]
+                )
             else:
                 if not _check_not_in_convert_recv_nodes(tensor_quant_overrides, tensor_name, type_req.consumers[1]):
-                    raise ValueError("Tensor override for '{tensor_name}' converts the type for consumers that need the original type.")
+                    raise ValueError(
+                        "Tensor override for '{tensor_name}' converts the type for consumers that need the original type."
+                    )
         # Both producer and consumers
         else:
             prod_type = type_req.producer_type
             consumer_type = type_req.consumers[0]
 
             if prod_type != consumer_type:
-                _add_to_convert_recv_nodes(tensor_quant_overrides, tensor_name, prod_type, consumer_type, type_req.consumers[1])
+                _add_to_convert_recv_nodes(
+                    tensor_quant_overrides, tensor_name, prod_type, consumer_type, type_req.consumers[1]
+                )
             else:
                 all_consumers = set([node.name for node in consumers[tensor_name]])
                 consumers_for_original_type = all_consumers.difference(type_req.consumers[1])
@@ -205,7 +228,9 @@ def _add_qtype_converts(tensor_quant_overrides, activation_type, value_infos, na
                     assert "convert" not in tensor_quant_overrides[tensor_name][0]
                 else:
                     # Some consumers don't want the overridden type.
-                    _add_to_convert_recv_nodes(tensor_quant_overrides, tensor_name, prod_type, activation_type, consumers_for_original_type)
+                    _add_to_convert_recv_nodes(
+                        tensor_quant_overrides, tensor_name, prod_type, activation_type, consumers_for_original_type
+                    )
 
 
 def get_qnn_qdq_config(
@@ -248,11 +273,12 @@ def get_qnn_qdq_config(
             assert output_name not in producers, "Tensor can only be generated by a single node"
             producers[output_name] = node
 
-
     tensor_quant_overrides = copy.deepcopy(init_overrides) if init_overrides else {}
 
     if tensor_quant_overrides and add_qtype_converts:
-        _add_qtype_converts(tensor_quant_overrides, activation_type, value_infos, name_to_initializer, producers, consumers)
+        _add_qtype_converts(
+            tensor_quant_overrides, activation_type, value_infos, name_to_initializer, producers, consumers
+        )
 
     for node in model.graph.node:
         if node.op_type == "MatMul" and weight_type in Q8_TYPES:
@@ -268,7 +294,6 @@ def get_qnn_qdq_config(
                         input_16bit_act = input_name
                 else:
                     input_wgt = input_name
-
 
             # Override initializer to use the weight_type
             if input_16bit_act and input_wgt:
@@ -294,20 +319,40 @@ def get_qnn_qdq_config(
             output_type = _get_output_activation_qtype(node.output[0], tensor_quant_overrides, activation_type)
 
             if output_type == QuantType.QUInt16:
-                _set_scale_zero_point(tensor_quant_overrides, node.output[0], output_type,
-                                      np.array(1.0 / 65536.0, dtype=np.float32), np.array(0, dtype=np.uint16))
+                _set_scale_zero_point(
+                    tensor_quant_overrides,
+                    node.output[0],
+                    output_type,
+                    np.array(1.0 / 65536.0, dtype=np.float32),
+                    np.array(0, dtype=np.uint16),
+                )
             elif output_type == QuantType.QInt16:
-                _set_scale_zero_point(tensor_quant_overrides, node.output[0], output_type,
-                                      np.array(1.0 / 32768.0, dtype=np.float32), np.array(0, dtype=np.int16))
+                _set_scale_zero_point(
+                    tensor_quant_overrides,
+                    node.output[0],
+                    output_type,
+                    np.array(1.0 / 32768.0, dtype=np.float32),
+                    np.array(0, dtype=np.int16),
+                )
         elif node.op_type == "Tanh":
             output_type = _get_output_activation_qtype(node.output[0], tensor_quant_overrides, activation_type)
 
             if output_type == QuantType.QUInt16:
-                _set_scale_zero_point(tensor_quant_overrides, node.output[0], output_type,
-                                      np.array(1.0 / 32768.0, dtype=np.float32), np.array(32768, dtype=np.uint16))
+                _set_scale_zero_point(
+                    tensor_quant_overrides,
+                    node.output[0],
+                    output_type,
+                    np.array(1.0 / 32768.0, dtype=np.float32),
+                    np.array(32768, dtype=np.uint16),
+                )
             elif output_type == QuantType.QInt16:
-                _set_scale_zero_point(tensor_quant_overrides, node.output[0], output_type,
-                                      np.array(1.0 / 32768.0, dtype=np.float32), np.array(0, dtype=np.int16))
+                _set_scale_zero_point(
+                    tensor_quant_overrides,
+                    node.output[0],
+                    output_type,
+                    np.array(1.0 / 32768.0, dtype=np.float32),
+                    np.array(0, dtype=np.int16),
+                )
 
     extra_options = {
         "MinimumRealRange": 0.0001,
