@@ -99,10 +99,6 @@ class BaseQuantizer:
         # TODO: Remove from on-qdq quantization
         self.tensor_quant_overrides = self._get_and_check_tensor_quant_overrides()
 
-        # TODO: Remove
-        # to store specified scale and zeropoint instead of calculated value, tensor_name->(scale, zeropoint)
-        self.used_scale_zp_map = {}
-
     def quantize_model(self):
         raise NotImplementedError
 
@@ -429,21 +425,6 @@ class BaseQuantizer:
             self.model.initializer_extend([q_weight_initializer])
 
         return q_weight_name, zp_name, scale_name
-
-    # TODO: Remove
-    def set_quant_scale_zp(self, tensor_name, value):
-        assert isinstance(value, tuple) and len(value) == 2, "value must be scale(float or float16) and zeropoint"
-        assert hasattr(value[0], "dtype")
-        assert tensor_name not in self.used_scale_zp_map, f"{tensor_name} has been setted before"
-        self.used_scale_zp_map[tensor_name] = value
-
-    # TODO: Remove
-    def find_quant_scale_zp(self, input_name):
-        if input_name in self.used_scale_zp_map:
-            return self.used_scale_zp_map[input_name]
-        if self.parent is not None:
-            return self.parent.find_quantized_value(input_name)
-        return (None, None)
 
     # TODO: Remove
     def _get_and_check_tensor_quant_overrides(self):

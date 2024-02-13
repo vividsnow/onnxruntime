@@ -35,7 +35,7 @@ def _is_tensor_quantizable(tensor_name, value_infos, name_to_initializer):
 
 
 def _get_output_activation_qtype(tensor_name, tensor_quant_overrides, activation_type):
-    if not tensor_name in tensor_quant_overrides:
+    if tensor_name not in tensor_quant_overrides:
         return activation_type
 
     override_list = tensor_quant_overrides[tensor_name]
@@ -288,7 +288,7 @@ def get_qnn_qdq_config(
             input_wgt = None
 
             for input_name in node.input:
-                if not input_name in name_to_initializer:
+                if input_name not in name_to_initializer:
                     qtype = _get_input_activation_qtype(tensor_quant_overrides, input_name, node.name, activation_type)
                     if qtype in Q16_TYPES:
                         input_16bit_act = input_name
@@ -303,7 +303,7 @@ def get_qnn_qdq_config(
 
             has_q16_activation = False
             for input_name in node.input:
-                if not input_name in name_to_initializer:
+                if input_name not in name_to_initializer:
                     qtype = _get_input_activation_qtype(tensor_quant_overrides, input_name, node.name, activation_type)
                     if qtype in Q16_TYPES:
                         has_q16_activation = True
