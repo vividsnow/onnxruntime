@@ -146,17 +146,14 @@ class QLinearMatMul(QOpMatMul):
         scale_names.extend(scale_names_weight)
 
         nodes.extend(nodes_weight)
-        (data_found, qparam_infos) = self.quantizer._get_quantization_params(node.output[0])
-        if not data_found:
-            return super().quantize()
-
         (
+            data_found,
             output_scale_name,
             output_zp_name,
             _,
             _,
-        ) = qparam_infos[0]
-        if quantized_input_names is None:
+        ) = self.quantizer._get_quantization_params(node.output[0])
+        if not data_found or quantized_input_names is None:
             return super().quantize()
 
         qlinear_matmul_output = node.output[0] + TENSOR_NAME_QUANT_SUFFIX

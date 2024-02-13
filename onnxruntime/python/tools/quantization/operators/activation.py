@@ -40,23 +40,20 @@ class QLinearActivation(QuantOperatorBase):
 
         # No assert on op_type as it is controlled by registry
         # only try to quantize when given quantization parameters for it
-        (data_found, qparam_infos) = self.quantizer._get_quantization_params(node.output[0], use_scale, use_zeropoint)
-        if not data_found:
-            return super().quantize()
-
         (
+            data_found,
             output_scale_name,
             output_zp_name,
             _,
             _,
-        ) = qparam_infos[0]
+        ) = self.quantizer._get_quantization_params(node.output[0], use_scale, use_zeropoint)
         (
             quantized_input_names,
             zero_point_names,
             scale_names,
             nodes,
         ) = self.quantizer.quantize_activation(node, [0])
-        if quantized_input_names is None:
+        if not data_found or quantized_input_names is None:
             return super().quantize()
 
         qlinear_activation_output = node.output[0] + TENSOR_NAME_QUANT_SUFFIX

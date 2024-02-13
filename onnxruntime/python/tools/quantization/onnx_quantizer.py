@@ -20,7 +20,6 @@ except ImportError:
 from .calibrate import TensorData
 from .onnx_model import ONNXModel
 from .quant_utils import (
-    NP_TYPE_TO_ONNX_TYPE,
     ONNX_TYPE_TO_NP_TYPE,
     TENSOR_NAME_QUANT_SUFFIX,
     QuantizationMode,
@@ -215,11 +214,6 @@ class ONNXQuantizer:
                     elif quant_type != quant_overrides.get("quant_type"):
                         raise ValueError(
                             "Channel quantization types for tensor '{tensor_name}' do not match at index {index}."
-                        )
-
-                    if isinstance(quant_type, list) and is_initializer:
-                        raise ValueError(
-                            f"Cannot provide two quant_type overrides for initializer '{tensor_name}' (only for activations)"
                         )
 
                     has_scale = "scale" in quant_overrides
@@ -708,16 +702,50 @@ class ONNXQuantizer:
 
         return input_scale_name, input_zp_name, [], []
 
-    def _make_zp_scale_initializers(
-        self,
-        zero_point_name,
-        zero_point_type,
-        zero_point_shape,
-        zero_point_values,
-        scale_name,
-        scale_shape,
-        scale_values,
-    ):
+    def _get_quantization_params(self, param_name, use_scale=None, use_zeropoint=None):
+        """
+        Create initializers and inputs in the graph for zero point and scale of output.
+        Zero point and scale values are obtained from self.quantization_params if specified.
+            parameter param_name: Name of the quantization parameter.
+            return: result, scale_name, zero_point_name, scale_shape, zero_point_shape.
+        """
+        zero_point_type = self.activation_qType
+
+        if use_scale is None or use_zeropoint is None:
+            if self.quantization_params is None or param_name not in self.quantization_params:
+                logging.info(f'Quantization parameters for tensor:"{param_name}" not specified')
+                return False, "", "", "", ""
+
+            params = self.quantization_params[param_name]
+            if not isinstance(params, QuantizationParams):
+                raise TypeError(f"Unexpected type {type(params)} for {param_name!r}.")
+            if params is None or len(params) != 3:
+                raise ValueError(
+                    "Quantization parameters should contain zero point, scale, quant type. "
+                    f"Specified values for output {param_name}: {params}"
+                )
+
+            zero_point_values = np.array([params["zero_point"]])
+            if not hasattr(params["scale"], "dtype") or params["scale"].dtype not in (np.float32, np.float16):
+                raise ValueError(f"Unexpected type {type(params['scale'])} and param_name={param_name!r}")
+            scale_values = np.array([params["scale"]])
+            assert scale_values.dtype != np.float64
+            # zero_point_type = params["quant_type"]
+            assert zero_point_type == params["quant_type"]
+        else:
+            zero_point_values = np.array([use_zeropoint])
+            scale_values = np.array([use_scale])
+            params = self.quantization_params[param_name]
+            if "scale" in params:
+                dtype = params["scale"].dtype
+                scale_values = scale_values.astype(dtype)
+            assert scale_values.dtype != np.float64
+
+        zero_point_shape = []
+        zero_point_name = param_name + "_zero_point"
+        scale_shape = []
+        scale_name = param_name + "_scale"
+
         # Add initializers
         init_zp = onnx.helper.make_tensor(
             zero_point_name, zero_point_type, zero_point_shape, zero_point_values.ravel().tolist()
@@ -728,96 +756,11 @@ class ONNXQuantizer:
         elif scale_values.dtype == np.float16:
             scale_type = onnx_proto.TensorProto.FLOAT16
         else:
-            raise ValueError(f"Unexpected dtype={scale_values.dtype} for param_name={scale_name!r}")
+            raise ValueError(f"Unexpected dtype={scale_values.dtype} for param_name={param_name!r}")
         init_scale = onnx.helper.make_tensor(scale_name, scale_type, scale_shape, scale_values.reshape((-1,)).tolist())
         self.model.add_initializer(init_scale)
 
-        return scale_name, zero_point_name, scale_shape, zero_point_shape
-
-    def _get_quantization_params(self, param_name, use_scale=None, use_zeropoint=None):
-        """
-        Create initializers and inputs in the graph for zero point and scale of output.
-        Zero point and scale values are obtained from self.quantization_params if specified.
-            parameter param_name: Name of the quantization parameter.
-            return: result, scale_name, zero_point_name, scale_shape, zero_point_shape.
-        """
-        all_zero_point_types = []
-        all_zero_point_values = []
-        all_scale_values = []
-
-        if use_scale is None or use_zeropoint is None:
-            if self.quantization_params is None or param_name not in self.quantization_params:
-                logging.info(f'Quantization parameters for tensor:"{param_name}" not specified')
-                return False, "", "", "", ""
-
-            all_qparams = self.quantization_params[param_name]
-
-            for params in all_qparams:
-                if not isinstance(params, QuantizationParams):
-                    raise TypeError(f"Unexpected type {type(params)} for {param_name!r}.")
-                if params is None or len(params) != 3:
-                    raise ValueError(
-                        "Quantization parameters should contain zero point, scale, quant type. "
-                        f"Specified values for output {param_name}: {params}"
-                    )
-
-                zero_point_values = np.array([params["zero_point"]])
-                all_zero_point_values.append(zero_point_values)
-                all_zero_point_types.append(params["quant_type"])
-
-                if not hasattr(params["scale"], "dtype") or params["scale"].dtype not in (np.float32, np.float16):
-                    raise ValueError(f"Unexpected type {type(params['scale'])} and param_name={param_name!r}")
-                scale_values = np.array([params["scale"]])
-                assert scale_values.dtype != np.float64
-                all_scale_values.append(scale_values)
-
-                # zero_point_type = params["quant_type"]
-                # NOTE(Adrian) removed: assert zero_point_type == params["quant_type"]
-        else:
-            if isinstance(use_zeropoint, list):
-                assert isinstance(use_scale, list)
-                all_zero_point_types.extend([NP_TYPE_TO_ONNX_TYPE[zp.dtype] for zp in use_zeropoint])
-                all_zero_point_values.extend([np.array([zp]) for zp in use_zeropoint])
-                all_scale_values.extend([np.array([sc]) for sc in use_scale])
-            else:
-                zero_point_values = np.array([use_zeropoint])
-                scale_values = np.array([use_scale])
-
-                assert len(self.quantization_params[param_name]) == 1
-                params = self.quantization_params[param_name][0]
-                if "scale" in params:
-                    dtype = params["scale"].dtype
-                    scale_values = scale_values.astype(dtype)
-                assert scale_values.dtype != np.float64
-
-                # all_zero_point_types.append(self.activation_qType)
-                all_zero_point_types.append(NP_TYPE_TO_ONNX_TYPE[use_zeropoint.dtype])
-                all_zero_point_values.append(zero_point_values)
-                all_scale_values.append(scale_values)
-
-        num_qparams = len(all_zero_point_types)
-        assert num_qparams == len(all_zero_point_values) and num_qparams == len(all_scale_values)
-
-        ret_vals = []
-        for i in range(num_qparams):
-            zero_point_shape = []
-            zero_point_name = param_name + "_zero_point_" + str(i)
-            scale_shape = []
-            scale_name = param_name + "_scale_" + str(i)
-
-            ret_vals.append(
-                self._make_zp_scale_initializers(
-                    zero_point_name,
-                    all_zero_point_types[i],
-                    zero_point_shape,
-                    all_zero_point_values[i],
-                    scale_name,
-                    scale_shape,
-                    all_scale_values[i],
-                )
-            )
-
-        return True, ret_vals
+        return True, scale_name, zero_point_name, scale_shape, zero_point_shape
 
     def _get_quantize_input_nodes(self, node, input_index, qType, given_scale_name=None, given_zp_name=None):
         """
@@ -841,8 +784,7 @@ class ONNXQuantizer:
         if (given_scale_name is not None) and (given_zp_name is not None):
             data_found, scale_name, zp_name = (True, given_scale_name, given_zp_name)
         else:
-            data_found, qparam_infos = self._get_quantization_params(input_name)
-            scale_name, zp_name, _, _ = qparam_infos[0]
+            data_found, scale_name, zp_name, _, _ = self._get_quantization_params(input_name)
 
         nodes = []
         if data_found:
@@ -885,7 +827,7 @@ class ONNXQuantizer:
 
     def set_quant_scale_zp(self, tensor_name, value):
         assert isinstance(value, tuple) and len(value) == 2, "value must be scale(float or float16) and zeropoint"
-        assert all(hasattr(val, "dtype") for val in value[0])
+        assert hasattr(value[0], "dtype")
         assert tensor_name not in self.used_scale_zp_map, f"{tensor_name} has been setted before"
         self.used_scale_zp_map[tensor_name] = value
 
@@ -926,11 +868,7 @@ class ONNXQuantizer:
         if input_name in self.quantized_value_map:
             input_scale_name = self.quantized_value_map[input_name].scale_name
         elif input_name in self.quantization_params:
-            _, qparam_infos = self._get_quantization_params(input_name)
-            if not qparam_infos or len(qparam_infos) > 1:
-                raise ValueError(f"Bias {input_name} must have only one quantization type in TensorQuantOverrides")
-
-            input_scale_name, _, _, _ = qparam_infos[0]
+            _, input_scale_name, _, _, _ = self._get_quantization_params(input_name)
         else:
             raise ValueError(f"Expected {input_name} to be in quantized value map for static quantization")
 
@@ -1456,46 +1394,22 @@ class ONNXQuantizer:
 
             quant_overrides = self.get_per_tensor_quant_overrides(tensor_name)
 
-            quant_types = [self.activation_qType]
+            quant_type = self.activation_qType
             if "quant_type" in quant_overrides:
-                if isinstance(quant_overrides["quant_type"], list):
-                    quant_types = [qt.tensor_type for qt in quant_overrides["quant_type"]]
-                else:
-                    quant_types = [quant_overrides["quant_type"].tensor_type]
+                quant_type = quant_overrides["quant_type"].tensor_type
 
             if "scale" in quant_overrides and "zero_point" in quant_overrides:
-                if isinstance(quant_overrides["scale"], list):
-                    zeros, scales = quant_overrides["zero_point"], quant_overrides["scale"]
-                else:
-                    zeros = [quant_overrides["zero_point"]]
-                    scales = [quant_overrides["scale"]]
-            elif onnx.TensorProto.FLOAT8E4M3FN in quant_types:
-                zeros = []
-                scales = []
-
-                for quant_type in quant_types:
-                    zero, scale = compute_scale_zp_float8(quant_type, td.avg_std[1])
-                    zeros.append(zero)
-                    scales.append(scale)
+                zero, scale = quant_overrides["zero_point"], quant_overrides["scale"]
+            elif quant_type == onnx.TensorProto.FLOAT8E4M3FN:
+                zero, scale = compute_scale_zp_float8(quant_type, td.avg_std[1])
             else:
                 rmin = quant_overrides.get("rmin", td.range_value[0])
                 rmax = quant_overrides.get("rmax", td.range_value[1])
                 symmetric = quant_overrides.get("symmetric", self.is_activation_symmetric)
                 reduce_range = quant_overrides.get("reduce_range", False)
+                qmin, qmax = get_qmin_qmax_for_qType(quant_type, reduce_range=reduce_range, symmetric=symmetric)
+                zero, scale = compute_scale_zp(rmin, rmax, qmin, qmax, symmetric, self.min_real_range)
 
-                zeros = []
-                scales = []
-
-                for quant_type in quant_types:
-                    qmin, qmax = get_qmin_qmax_for_qType(quant_type, reduce_range=reduce_range, symmetric=symmetric)
-                    zero, scale = compute_scale_zp(rmin, rmax, qmin, qmax, symmetric, self.min_real_range)
-                    zeros.append(zero)
-                    scales.append(scale)
-
-            qparams = []
-            for i in range(len(quant_types)):
-                qparams.append(QuantizationParams(zero_point=zeros[i], scale=scales[i], quant_type=quant_types[i]))
-
-            quantization_params[tensor_name] = qparams
+            quantization_params[tensor_name] = QuantizationParams(zero_point=zero, scale=scale, quant_type=quant_type)
 
         return quantization_params

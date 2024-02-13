@@ -17,17 +17,11 @@ class QLinearWhere(QuantOperatorBase):
             return
         (
             data_found,
-            qparam_infos,
-        ) = self.quantizer._get_quantization_params(node.output[0])
-        (
             output_scale_name,
             output_zp_name,
             _,
             _,
-        ) = (
-            qparam_infos[0] if data_found else (None, None, None, None)
-        )
-
+        ) = self.quantizer._get_quantization_params(node.output[0])
         (
             q_input_names,
             zero_point_names,

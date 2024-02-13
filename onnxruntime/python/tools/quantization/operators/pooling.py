@@ -12,16 +12,13 @@ class QLinearPool(QuantOperatorBase):
         node = self.node
 
         # only try to quantize when given quantization parameters for it
-        (data_found, qparam_infos) = self.quantizer._get_quantization_params(node.output[0])
-
         (
+            data_found,
             output_scale_name,
             output_zp_name,
             _,
             _,
-        ) = (
-            qparam_infos[0] if data_found else (None, None, None, None)
-        )
+        ) = self.quantizer._get_quantization_params(node.output[0])
 
         # get quantized input tensor names, quantize input if needed
         (

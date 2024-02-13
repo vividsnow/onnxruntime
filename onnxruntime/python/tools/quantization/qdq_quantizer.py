@@ -418,73 +418,6 @@ class QDQQuantizer(ONNXQuantizer):
             )
             self.quantized_value_map[tensor_name] = quantized_value
 
-    def _add_qdq_conversion_for_activation(
-        self, tensor_name, first_scale_name, first_zp_name, final_scale_name, final_zp_name, data_type=None
-    ):
-        if (
-            self.dedicated_qdq_pair
-            and tensor_name in self.tensor_to_its_receiving_nodes
-            and len(self.tensor_to_its_receiving_nodes[tensor_name]) > 1
-        ):
-            raise ValueError(
-                "Do not currently support two quant_types in TensorQuantOverrides when the `dedicated_qdq_pair` extra_option is enabled"
-            )
-        else:
-            # assert len(qparam_infos) == 2
-
-            first_q_input = tensor_name
-            final_dq_output = add_dequant_output_suffix(tensor_name)
-            if self.model.is_graph_output(tensor_name):
-                first_q_input = add_quant_input_suffix(tensor_name)
-                final_dq_output = tensor_name
-                self.model.replace_output_of_all_nodes(tensor_name, first_q_input)
-            else:
-                self.model.replace_input_of_all_nodes(tensor_name, final_dq_output)
-
-            first_q_output = add_quant_output_suffix(f"{tensor_name}_convert")
-            first_q_name = add_quant_suffix(tensor_name)
-            first_dq_input = first_q_output
-            first_dq_output = add_dequant_output_suffix(f"{tensor_name}_convert")
-            first_dq_name = add_dequant_suffix(f"{tensor_name}_convert")
-            # first_scale_name = qparam_infos[0][0]
-            # first_zp_name = qparam_infos[0][1]
-            self._create_qdq_nodes(
-                first_q_input,
-                first_q_output,
-                first_q_name,
-                first_dq_input,
-                first_dq_output,
-                first_dq_name,
-                first_scale_name,
-                first_zp_name,
-            )
-
-            second_q_output = add_quant_output_suffix(tensor_name)
-            second_q_name = add_quant_suffix(f"{tensor_name}_convert")
-            final_dq_name = add_dequant_suffix(tensor_name)
-            # final_scale_name = qparam_infos[1][0]
-            # final_zp_name = qparam_infos[1][1]
-            self._create_qdq_nodes(
-                first_dq_output,  # q_input
-                second_q_output,  # q_output
-                second_q_name,  # quant_node_name
-                second_q_output,  # dq_input
-                final_dq_output,  # dq_output
-                final_dq_name,  # dequant_node_name
-                final_scale_name,
-                final_zp_name,
-            )
-
-            quantized_value = QuantizedValue(
-                tensor_name,
-                final_dq_output,
-                final_scale_name,
-                final_zp_name,
-                QuantizedValueType.Input,
-                scale_type=data_type,
-            )
-            self.quantized_value_map[tensor_name] = quantized_value
-
     def _quantize_normal_tensors(self):
         for tensor_name, tensor_info in self.tensors_to_quantize.copy().items():
             if tensor_name in self.quantized_value_map:
@@ -497,11 +430,13 @@ class QDQQuantizer(ONNXQuantizer):
                     self._add_qdq_pair_for_initializer(initializer, tensor_info.tensor_type, tensor_info.axis)
                 else:
                     used_scale, used_zp = self.find_quant_scale_zp(tensor_name)
-                    if used_scale is not None and not hasattr(used_scale[0], "dtype"):
+                    if used_scale is not None and not hasattr(used_scale, "dtype"):
                         raise TypeError(
                             f"Unexpected type {type(used_scale)} for used_scale and tensor_name={tensor_name!r}"
                         )
-                    data_found, qparam_infos = self._get_quantization_params(tensor_name, used_scale, used_zp)
+                    data_found, scale_name, zp_name, _, _ = self._get_quantization_params(
+                        tensor_name, used_scale, used_zp
+                    )
 
                     if not data_found:
                         raise ValueError(
@@ -509,21 +444,7 @@ class QDQQuantizer(ONNXQuantizer):
                             "In static mode quantization params for inputs and outputs of nodes to be quantized are required."
                         )
 
-                    if len(qparam_infos) == 1:
-                        scale_name, zp_name, _, _ = qparam_infos[0]
-                        self._add_qdq_pair_for_activation(
-                            tensor_name, scale_name, zp_name, data_type=tensor_info.data_type
-                        )
-                    else:
-                        assert len(qparam_infos) == 2
-                        self._add_qdq_conversion_for_activation(
-                            tensor_name,
-                            qparam_infos[0][0],
-                            qparam_infos[0][1],
-                            qparam_infos[1][0],
-                            qparam_infos[1][1],
-                            data_type=tensor_info.data_type,
-                        )
+                    self._add_qdq_pair_for_activation(tensor_name, scale_name, zp_name, data_type=tensor_info.data_type)
 
                 del self.tensors_to_quantize[tensor_name]
 
@@ -539,24 +460,7 @@ class QDQQuantizer(ONNXQuantizer):
                     initializer = find_by_name(tensor_name, self.model.initializer())
                     if initializer is not None:
                         raise ValueError("Quantization parameter shared mode is not supported for weight yet")
-                    data_found, qparam_infos = self._get_quantization_params(tensor_name, None, None)
-
-                    if not data_found or len(qparam_infos) == 1:
-                        self._add_qdq_pair_for_activation(
-                            tensor_name, quantized_value.scale_name, quantized_value.zp_name
-                        )
-                    else:
-                        assert len(qparam_infos) == 2
-                        # qparam_infos[0][0] = quantized_value.scale_name
-                        # qparam_infos[0][1] = quantized_value.zp_name
-                        self._add_qdq_conversion_for_activation(
-                            tensor_name,
-                            quantized_value.scale_name,
-                            quantized_value.zp_name,
-                            qparam_infos[1][0],
-                            qparam_infos[1][1],
-                            data_type=tensor_info.data_type,
-                        )
+                    self._add_qdq_pair_for_activation(tensor_name, quantized_value.scale_name, quantized_value.zp_name)
 
     def _quantize_bias_tensors(self):
         for bias_name, input_name, weight_name, beta in self.bias_to_quantize:

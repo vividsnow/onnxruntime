@@ -43,15 +43,13 @@ class QLinearGemm(QOpMatMul):
         node = self.node
         assert node.op_type == "Gemm"
 
-        (data_found, qparam_infos) = self.quantizer._get_quantization_params(node.output[0])
         (
+            data_found,
             output_scale_name,
             output_zp_name,
             _,
             _,
-        ) = (
-            qparam_infos[0] if data_found else (None, None, None, None)
-        )
+        ) = self.quantizer._get_quantization_params(node.output[0])
 
         if self.quantizer.is_input_a_initializer(node.input[1]) and self.quantizer.is_per_channel():
             (
