@@ -95,7 +95,7 @@ class BaseQuantizer:
         self.opset_version = self.check_opset_version()
 
         # TODO: Remove from on-qdq quantization
-        self.tensor_quant_overrides = self._get_and_check_tensor_quant_overrides()
+        self.tensor_quant_overrides, self.tensor_quant_override_types = self._get_and_check_tensor_quant_overrides()
 
     def quantize_model(self):
         raise NotImplementedError
@@ -430,6 +430,7 @@ class BaseQuantizer:
         Get tensor quantization overrides and check correctness.
         """
         tensor_quant_overrides = self.extra_options.get("TensorQuantOverrides", {})
+        tensor_quant_override_types = set()
 
         # Validate that compatible/valid overrides are provided.
         if tensor_quant_overrides:
@@ -462,6 +463,8 @@ class BaseQuantizer:
                     # other channels.
                     if index == 0:
                         quant_type = quant_overrides.get("quant_type")
+                        if quant_type:
+                            tensor_quant_override_types.add(quant_type.tensor_type)
                     elif quant_type != quant_overrides.get("quant_type"):
                         raise ValueError(
                             "Channel quantization types for tensor '{tensor_name}' do not match at index {index}."
@@ -482,7 +485,47 @@ class BaseQuantizer:
                                     f"Tensor override option '{key}' is invalid with 'scale' and 'zero_point'"
                                 )
 
-        return tensor_quant_overrides
+                    if "convert" in quant_overrides:
+                        if index > 0:
+                            raise ValueError(
+                                f"Per-channel overrides (tensor '{tensor_name}') do not support 'convert'."
+                            )
+
+                        if is_initializer:
+                            raise ValueError("Cannot use 'convert' override for initializers")
+
+                        if "quant_type" not in quant_overrides["convert"]:
+                            raise ValueError(f"'convert' options (tensor '{tensor_name}') must specify a 'quant_type'")
+
+                        convert_quant_type = quant_overrides["convert"]["quant_type"].tensor_type
+                        original_quant_type = (
+                            quant_type.tensor_type if quant_type is not None else self.activation_qType
+                        )
+                        if convert_quant_type == original_quant_type:
+                            raise ValueError(
+                                f"'convert' quant_type must differ from original quant_type (tensor '{tensor_name}')"
+                            )
+
+                        convert_has_scale = "scale" in quant_overrides["convert"]
+                        convert_has_zero_point = "zero_point" in quant_overrides["convert"]
+
+                        if (convert_has_scale and not convert_has_zero_point) or (
+                            convert_has_zero_point and not convert_has_scale
+                        ):
+                            raise ValueError(
+                                f"Must provide both 'scale' and 'zero_point' if one of the overrides is provided (tensor '{tensor_name}')"
+                            )
+
+                        if convert_has_scale:
+                            for key in keys_unsupported_with_scale_zp:
+                                if key in quant_overrides["convert"]:
+                                    raise ValueError(
+                                        f"Tensor override option '{key}' is invalid with 'scale' and 'zero_point' (tensor '{tensor_name}')"
+                                    )
+
+                        tensor_quant_override_types.add(convert_quant_type)
+
+        return tensor_quant_overrides, tensor_quant_override_types
 
     # TODO: Remove
     def get_per_tensor_quant_overrides(self, tensor_name):
