@@ -866,7 +866,7 @@ class QDQQuantizer(BaseQuantizer):
             raise ValueError(f"Unexpected type {type(params['scale'])} and param_name={param_name!r}")
         scale_values = np.array([params["scale"]])
         assert scale_values.dtype != np.float64
-        zero_point_type = params.get("quant_type", self.activation_qType)
+        zero_point_type = params.data.get("quant_type", self.activation_qType)
 
         zero_point_shape = []
         zero_point_name = param_name + "_zero_point" + init_name_suffix
@@ -946,12 +946,12 @@ class QDQQuantizer(BaseQuantizer):
                 raise TypeError(f"Unexpected type {type(td)} for {tensor_name!r}.")
 
             quant_overrides = self.get_per_tensor_quant_overrides(tensor_name)
-            original = self.calculate_quantization_params(quant_overrides)
+            original = self.calculate_quantization_params(td, quant_overrides)
             converted = None
             converted_recv_nodes = None
 
             if "convert" in quant_overrides:
-                converted = self.calculate_quantization_params(quant_overrides["convert"])
+                converted = self.calculate_quantization_params(td, quant_overrides["convert"])
                 converted_recv_nodes = quant_overrides["convert"].get("recv_nodes")
 
             quantization_params[tensor_name] = QDQTensorQuantParams(original, converted, converted_recv_nodes)
