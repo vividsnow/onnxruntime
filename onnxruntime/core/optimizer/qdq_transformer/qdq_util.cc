@@ -77,7 +77,7 @@ bool IsQDQPairSupported(
 }
 
 bool IsDQQConversion(
-    const Node& q_node, const Node& dq_node,
+    const Node& dq_node, const Node& q_node,
     const GetConstantInitializerFn& get_const_initializer,
     const Path& model_path) {
   ConstPointerContainer<std::vector<NodeArg*>> dq_input_defs = dq_node.InputDefs();

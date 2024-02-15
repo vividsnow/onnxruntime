@@ -325,18 +325,6 @@ class BaseOpBuilder : public IOpBuilder {
   const std::vector<size_t> cnhw2hwcn_perm{2, 3, 0, 1};
 };
 
-class ConvertOpBuilder : public BaseOpBuilder {
- public:
-  ConvertOpBuilder() : BaseOpBuilder("ConvertOpBuilder") {}
-  ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(ConvertOpBuilder);
-
-  Status AddConvertToModelBuilder(QnnModelWrapper& qnn_model_wrapper,
-                                  const NodeUnit& dq_node_unit,
-                                  const NodeUnit& q_node_unit,
-                                  const logging::Logger& logger,
-                                  bool do_op_validation) const ORT_MUST_USE_RESULT;
-};
-
 // Type that holds information about an ONNX attribute.
 template <typename ValType>
 struct OnnxAttrInfo {
