@@ -509,3 +509,27 @@ class BaseQuantizer:
             )
 
         return quant_overrides_list
+
+    def adjust_tensor_ranges(self, softmax_0_to_1=False):
+        if self.tensors_range is None:
+            return
+
+        for node in self.model.nodes():
+            # adjust tensor_ranges for input of Clip and Relu node
+            if node.op_type in ["Clip", "Relu"]:
+                if self.is_activation_symmetric:
+                    continue
+                if not self.should_quantize_node(node):
+                    continue
+                if len(self.model.input_name_to_nodes()[node.input[0]]) != 1:
+                    continue
+                if node.input[0] not in self.tensors_range or node.output[0] not in self.tensors_range:
+                    continue
+                td = self.tensors_range[node.output[0]]
+                if not isinstance(td, TensorData):
+                    raise TypeError(f"Unexpected type {type(td)} for {node.output[0]!r}.")
+                self.tensors_range[node.input[0]] = td
+            # Optionally, adjust Softmax to range from 0.0 to 1.0
+            elif node.op_type == "Softmax" and softmax_0_to_1:
+                self.tensors_range[node.output[0]] = TensorData(lowest=np.float32(0.0), highest=np.float32(1.0))
+

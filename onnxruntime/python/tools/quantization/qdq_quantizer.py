@@ -3,7 +3,10 @@
 # Licensed under the MIT License. See License.txt in the project root for
 # license information.
 # --------------------------------------------------------------------------
+from __future__ import annotations
+
 import logging
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict
 
@@ -43,6 +46,11 @@ class QDQQuantTensorType(Enum):
     BIAS = 2
 
 
+@dataclass
+class QDQQuantParamProvider:
+    input_name: str
+    node_name: str
+
 class QDQTensorQuantInfo:
     def __init__(self, tensor_type=QDQQuantTensorType.ACTIVATION, quant_para_provider=None, axis=None, data_type=None):
         self.tensor_type = tensor_type
@@ -53,7 +61,7 @@ class QDQTensorQuantInfo:
         self.data_type = data_type
 
 
-# TODO: Remove
+# TODO: Move to base_quantizer.py?
 class QuantizationParamsTmp:
     def __init__(self, **data: Dict[str, Any]):
         self.data = {}
@@ -75,6 +83,40 @@ class QuantizationParamsTmp:
     def __len__(self):
         return len(self.data)
 
+@dataclass
+class QDQTensorQuantParams:
+    original: QuantizationParamsTmp
+    converted: QuantizationParamsTmp | None
+    converted_recv_nodes: set[str] | None
+
+@dataclass
+class QDQQuantParamsInitializers:
+    scale: TensorProto
+    zero_point: TensorProto
+
+@dataclass
+class QDQTensorQuantParamsInitializers:
+    original: QDQQuantParamsInitializers
+    converted: QDQQuantParamsInitializers | None
+    converted_recv_nodes: set[str] | None
+
+@dataclass
+class QDQTensorQuantizedValue:
+    original: QuantizedValue
+    converted: QuantizedValue | None
+    converted_recv_nodes: set[str] | None
+
+    def get_for_consumer(self, consumer_node_name) -> QuantizedValue:
+        if self.converted is None:  # Quantized value is not converted, return original
+            return self.original
+
+        if not self.converted_recv_nodes:  # All consumers receive the converted value
+            return self.converted
+
+        # Check if consumer node name is in the list of nodes that
+        # receive the converted quantization value. If not, return the original value generated
+        # by the tensor's producer.
+        return self.converted if (consumer_node_name in self.converted_recv_nodes) else self.original
 
 class QDQQuantizer(BaseQuantizer):
     def __init__(
@@ -105,12 +147,6 @@ class QDQQuantizer(BaseQuantizer):
             op_types_to_quantize,
             extra_options,
         )
-
-        if self.tensors_range:
-            # Force Softmax to range from 0.0 to 1.0
-            for node in self.model.nodes():
-                if node.op_type == "Softmax":
-                    self.tensors_range[node.output[0]] = TensorData(lowest=np.float32(0.0), highest=np.float32(1.0))
 
         self.tensors_to_quantize = {}
         self.bias_to_quantize = []
@@ -160,7 +196,7 @@ class QDQQuantizer(BaseQuantizer):
             self.qdq_op_domain = ms_domain
 
         # TODO: Remove
-        self.quantization_params = self.calculate_quantization_params()
+        self.quantization_params = self.calculate_graph_quantization_params()
 
         # TODO: Remove
         # Map of all original value names to quantized value names
@@ -203,45 +239,52 @@ class QDQQuantizer(BaseQuantizer):
 
         return False
 
-    def __quantize_tensor(self, tensor_name, quant_sharing_param=None, tensor_type=QDQQuantTensorType.ACTIVATION):
+    def __quantize_tensor(self, tensor_name, quant_sharing_provider=None, tensor_type=QDQQuantTensorType.ACTIVATION):
         """
         Quantize tensors. If quant_param_tensor is not None, tensor with name tensor_name will be quantized with same
         quantization parameters as tensor quant_param_tensor
 
         Args:
             tensor_name: name of the tensor to quantize
-            quant_sharing_param: name of the tensor that provides quantization parameter
+            quant_sharing_provider: name of the tensor and node that provides quantization parameter
             tensor_type: QDQQuantTensorType default ACTIVATION
         """
         if self._is_tensor_quantizable(tensor_name):
-            if quant_sharing_param:
+            if quant_sharing_provider:
+                if not isinstance(quant_sharing_provider, QDQQuantParamProvider):
+                    raise TypeError(f"quant_sharing_provider must be of type QDQQuantParamProvider, not {type(quant_sharing_provider)}.")
+
                 data_type = self._get_tensor_type(tensor_name)
                 self.tensors_to_quantize[tensor_name] = QDQTensorQuantInfo(
-                    tensor_type=tensor_type, quant_para_provider=quant_sharing_param, data_type=data_type
+                    tensor_type=tensor_type, quant_para_provider=quant_sharing_provider, data_type=data_type
                 )
             elif tensor_name not in self.tensors_to_quantize:
                 data_type = self._get_tensor_type(tensor_name)
                 self.tensors_to_quantize[tensor_name] = QDQTensorQuantInfo(tensor_type=tensor_type, data_type=data_type)
 
-    def quantize_activation_tensor(self, tensor_name, quant_sharing_param=None):
+    def quantize_activation_tensor(self, tensor_name):
         """
         Quantize Activation Tensor
         Args:
             tensor_name: name of the tensor to quantize
-            quant_sharing_param: name of the tensor that provides quantization parameter
 
         """
-        return self.__quantize_tensor(tensor_name, quant_sharing_param, QDQQuantTensorType.ACTIVATION)
+        return self.__quantize_tensor(tensor_name, None, QDQQuantTensorType.ACTIVATION)
 
-    def quantize_weight_tensor(self, tensor_name, quant_sharing_param=None):
+    def quantize_output_same_as_input(self, output_name, input_name, node_name):
+        """
+        Quantize a node's output the same as one of its inputs.
+        """
+        return self.__quantize_tensor(tensor_name, QDQQuantParamProvider(input_name, node_name), QDQQuantTensorType.ACTIVATION)
+
+    def quantize_weight_tensor(self, tensor_name):
         """
         Quantize Weight Tensor
         Args:
             tensor_name: name of the tensor to quantize
-            quant_sharing_param: name of the tensor that provides quantization parameter
 
         """
-        return self.__quantize_tensor(tensor_name, quant_sharing_param, QDQQuantTensorType.WEIGHT)
+        return self.__quantize_tensor(tensor_name, None, QDQQuantTensorType.WEIGHT)
 
     def quantize_weight_tensor_per_channel(self, tensor_name, axis):
         weight = find_by_name(tensor_name, self.model.initializer())
@@ -253,7 +296,7 @@ class QDQQuantizer(BaseQuantizer):
         else:
             logging.warning(f"only support per-channel quantization on weight. Tensor: {tensor_name} is not quantized.")
 
-    def quantize_bias_tensor(self, bias_name, input_name, weight_name, beta=1.0):
+    def quantize_bias_tensor(self, node_name, bias_name, input_name, weight_name, beta=1.0):
         # If the user provided quantization overrides for this tensor, treat it as a regular weight.
         if self.tensor_quant_overrides.get(bias_name):
             logging.info(
@@ -268,7 +311,7 @@ class QDQQuantizer(BaseQuantizer):
         weight = find_by_name(bias_name, self.model.initializer())
         if weight is not None:
             if weight.data_type in (onnx_proto.TensorProto.FLOAT, onnx_proto.TensorProto.FLOAT16):
-                self.bias_to_quantize.append((bias_name, input_name, weight_name, beta))
+                self.bias_to_quantize.append((node_name, bias_name, input_name, weight_name, beta))
         else:
             logging.warning(f"Expected {bias_name} to be a weight")
 
@@ -312,6 +355,7 @@ class QDQQuantizer(BaseQuantizer):
             and not self.model.is_graph_output(upstream_output_name)
             and not self.model.is_graph_input(upstream_output_name)
         ):
+            # TODO: Check same qtype
             self.model.replace_output_of_all_nodes(upstream_output_name, output_name)
             if upstream_output_name in self.tensors_to_quantize:
                 del self.tensors_to_quantize[upstream_output_name]
@@ -486,26 +530,36 @@ class QDQQuantizer(BaseQuantizer):
     def _quantize_sharing_param_tensors(self):
         while self.tensors_to_quantize:
             for tensor_name, tensor_info in self.tensors_to_quantize.copy().items():
-                tensor_provider_name = tensor_info.quant_para_provider
-                if tensor_provider_name in self.quantized_value_map:
+                quant_provider = tensor_info.quant_para_provider
+                if quant_provider and quant_provider.input_name in self.quantized_value_map:
                     del self.tensors_to_quantize[tensor_name]
 
-                    quantized_value = self.quantized_value_map[tensor_provider_name]
-                    # Quantize the input
-                    initializer = find_by_name(tensor_name, self.model.initializer())
-                    if initializer is not None:
+                    quantized_value = self.quantized_value_map[quant_provider.input_name].get_for_consumer(quant_provider.node_name)
+                    if self.is_input_a_initializer(tensor_name):
                         raise ValueError("Quantization parameter shared mode is not supported for weight yet")
-                    self._add_qdq_pair_for_activation(tensor_name, quantized_value.scale_name, quantized_value.zp_name)
+
+                    # TODO: Don't overlook potential conversion at the output!
+                    converted_qparam_inits = None
+                    if tensor_name in self.quantization_params:
+                        tensor_params = self.quantization_params[tensor_name]
+                        if tensor_params.converted:
+                            converted_qparam_inits = self.__make_initializers(tensor_name, tensor_params.converted, "_convert")
+
+                    if converted_qparam_inits is not None:
+                        # TODO
+                        pass
+                    else:
+                        self._add_qdq_pair_for_activation(tensor_name, quantized_value.scale_name, quantized_value.zp_name)
 
     def _quantize_bias_tensors(self):
-        for bias_name, input_name, weight_name, beta in self.bias_to_quantize:
+        for bias_node_name, bias_name, input_name, weight_name, beta in self.bias_to_quantize:
             if bias_name in self.quantized_value_map:
                 continue
             # Quantize the input
-            self.quantize_bias_static(bias_name, input_name, weight_name, beta)
+            self.quantize_bias_static(bias_node_name, bias_name, input_name, weight_name, beta)
             init = find_by_name(bias_name, self.model.initializer())
             self.model.remove_initializer(init)
-            quant_value = self.quantized_value_map[bias_name]
+            quant_value = self.quantized_value_map[bias_name].original
             if quant_value.node_type == "Cast":
                 # simple cast to float 16 and not DequantizeLinear
                 # cublasLtMatmul only supports (b)float16, float bias.
@@ -550,7 +604,7 @@ class QDQQuantizer(BaseQuantizer):
             self.model.add_node(dequant_node)
 
     def is_tensor_quantized(self, tensor_name):
-        return tensor_name in self.tensors_to_quantize or tensor_name in self.bias_to_quantize
+        return tensor_name in self.tensors_to_quantize
 
     def quantize_initializer(self, weight, qType, reduce_range=False, keep_float_weight=False):
         """
@@ -617,28 +671,22 @@ class QDQQuantizer(BaseQuantizer):
 
         return q_weight_name, zp_name, scale_name
 
-    def quantize_bias_static(self, bias_name, input_name, weight_name, beta=1.0):
+    def quantize_bias_static(self, node_name, bias_name, input_name, weight_name, beta=1.0):
         """
         Quantized the bias. Zero Point == 0 and Scale == Input_Scale * Weight_Scale
         """
 
         # Handle case where bias already in quantization map
         if bias_name in self.quantized_value_map:
-            return self.quantized_value_map[bias_name].q_name
+            return self.quantized_value_map[bias_name].original.q_name
 
         # get scale for weight
-        weight_scale_name = self.quantized_value_map[weight_name].scale_name
+        weight_scale_name = self.quantized_value_map[weight_name].original.scale_name
         weight_initializer = find_by_name(weight_scale_name, self.model.initializer())
         weight_scale = tensor_proto_to_array(weight_initializer)
 
         # get scale for input
-        if input_name in self.quantized_value_map:
-            input_scale_name = self.quantized_value_map[input_name].scale_name
-        elif input_name in self.quantization_params:
-            _, input_scale_name, _, _, _ = self._get_quantization_params(input_name)
-        else:
-            raise ValueError(f"Expected {input_name} to be in quantized value map for static quantization")
-
+        input_scale_name = self.quantized_value_map[input_name].get_for_consumer(node_name).scale_name
         inputscale_initializer = find_by_name(input_scale_name, self.model.initializer())
         input_scale = tensor_proto_to_array(inputscale_initializer)
 
@@ -651,7 +699,6 @@ class QDQQuantizer(BaseQuantizer):
             node_qtype,
         ) = self.quantize_bias_static_impl(bias_name, input_scale, weight_scale, beta)
 
-        assert bias_name not in self.quantized_value_map
         quantized_value = QuantizedValue(
             bias_name,
             quantized_bias_name,
@@ -662,60 +709,32 @@ class QDQQuantizer(BaseQuantizer):
             node_type=node_type,
             node_qtype=node_qtype,
         )
-        self.quantized_value_map[bias_name] = quantized_value
+        self.quantized_value_map[bias_name].original = quantized_value
 
         return quantized_bias_name
 
-    # TODO: Remove
-    def _get_quantization_params(self, param_name, use_scale=None, use_zeropoint=None):
-        """
-        Create initializers and inputs in the graph for zero point and scale of output.
-        Zero point and scale values are obtained from self.quantization_params if specified.
-            parameter param_name: Name of the quantization parameter.
-            return: result, scale_name, zero_point_name, scale_shape, zero_point_shape.
-        """
-        zero_point_type = self.activation_qType
-
-        if use_scale is None or use_zeropoint is None:
-            if self.quantization_params is None or param_name not in self.quantization_params:
-                logging.info(f'Quantization parameters for tensor:"{param_name}" not specified')
-                return False, "", "", "", ""
-
-            params = self.quantization_params[param_name]
-            if not isinstance(params, QuantizationParamsTmp):
-                raise TypeError(f"Unexpected type {type(params)} for {param_name!r}.")
-            if params is None or len(params) != 3:
-                raise ValueError(
-                    "Quantization parameters should contain zero point, scale, quant type. "
-                    f"Specified values for output {param_name}: {params}"
-                )
-
-            zero_point_values = np.array([params["zero_point"]])
-            if not hasattr(params["scale"], "dtype") or params["scale"].dtype not in (np.float32, np.float16):
-                raise ValueError(f"Unexpected type {type(params['scale'])} and param_name={param_name!r}")
-            scale_values = np.array([params["scale"]])
-            assert scale_values.dtype != np.float64
-            # zero_point_type = params["quant_type"]
-            assert zero_point_type == params["quant_type"]
-        else:
-            zero_point_values = np.array([use_zeropoint])
-            scale_values = np.array([use_scale])
-            params = self.quantization_params[param_name]
-            if "scale" in params:
-                dtype = params["scale"].dtype
-                scale_values = scale_values.astype(dtype)
-            assert scale_values.dtype != np.float64
+    def __make_initializers(self,
+                            param_name: str,
+                            params: QuantizationParamsTmp,
+                            init_name_suffix: str = "") -> QDQQuantParamsInitializers:
+        zero_point_values = np.array([params["zero_point"]])
+        if not hasattr(params["scale"], "dtype") or params["scale"].dtype not in (np.float32, np.float16):
+            raise ValueError(f"Unexpected type {type(params['scale'])} and param_name={param_name!r}")
+        scale_values = np.array([params["scale"]])
+        assert scale_values.dtype != np.float64
+        zero_point_type = params.get("quant_type", self.activation_qType)
 
         zero_point_shape = []
-        zero_point_name = param_name + "_zero_point"
+        zero_point_name = param_name + "_zero_point" + init_name_suffix
         scale_shape = []
-        scale_name = param_name + "_scale"
+        scale_name = param_name + "_scale" + init_name_suffix
 
-        # Add initializers
+        # Add initializers to model
         init_zp = onnx.helper.make_tensor(
             zero_point_name, zero_point_type, zero_point_shape, zero_point_values.ravel().tolist()
         )
         self.model.add_initializer(init_zp)
+
         if scale_values.dtype == np.float32:
             scale_type = onnx_proto.TensorProto.FLOAT
         elif scale_values.dtype == np.float16:
@@ -725,29 +744,56 @@ class QDQQuantizer(BaseQuantizer):
         init_scale = onnx.helper.make_tensor(scale_name, scale_type, scale_shape, scale_values.reshape((-1,)).tolist())
         self.model.add_initializer(init_scale)
 
-        return True, scale_name, zero_point_name, scale_shape, zero_point_shape
+        return QDQQuantParamsInitializers(init_scale, init_zp)
 
-    # TODO: Remove
-    def calculate_quantization_params(self):
+    def _create_quantization_initializers(self, param_name: str) -> QDQTensorQuantParamsInitializers:
+        """
+        Create initializers and inputs in the graph for zero point and scale of output.
+        Zero point and scale values are obtained from self.quantization_params.
+            parameter param_name: Name of the quantization parameter.
+            return: QDQTensorQuantParamsInitializers
+        """
+        zero_point_type = self.activation_qType
+
+        if self.quantization_params is None or param_name not in self.quantization_params:
+            logging.info(f'Quantization parameters for tensor:"{param_name}" not specified')
+            return False, "", "", "", ""
+
+        tensor_params = self.quantization_params[param_name]
+        if not isinstance(tensor_params, QDQTensorQuantParams):
+            raise TypeError(f"Unexpected type {type(tensor_params)} for {param_name!r}.")
+
+        original_inits = self.__make_initializers(param_name, tensor_params.original)
+        converted_inits = self.__make_initializers(param_name, tensor_params.converted, "_convert") if tensor_params.converted else None
+
+        return QDQTensorQuantParamsInitializers(original_inits, converted_inits, tensor_params.converted_recv_nodes)
+
+    def calculate_quantization_params(self, tensor_data: TensorData, quant_overrides) - QuantizationParamsTmp:
+        quant_type = self.activation_qType
+        if "quant_type" in quant_overrides:
+            quant_type = quant_overrides["quant_type"].tensor_type
+
+        if "scale" in quant_overrides and "zero_point" in quant_overrides:
+            zero, scale = quant_overrides["zero_point"], quant_overrides["scale"]
+        elif quant_type == onnx.TensorProto.FLOAT8E4M3FN:
+            zero, scale = compute_scale_zp_float8(quant_type, tensor_data.avg_std[1])
+        else:
+            rmin = quant_overrides.get("rmin", tensor_data.range_value[0])
+            rmax = quant_overrides.get("rmax", tensor_data.range_value[1])
+            symmetric = quant_overrides.get("symmetric", self.is_activation_symmetric)
+            reduce_range = quant_overrides.get("reduce_range", False)
+            qmin, qmax = get_qmin_qmax_for_qType(quant_type, reduce_range=reduce_range, symmetric=symmetric)
+            zero, scale = compute_scale_zp(rmin, rmax, qmin, qmax, symmetric, self.min_real_range)
+
+        return QuantizationParamsTmp(
+            zero_point=zero, scale=scale, quant_type=quant_type
+        )
+
+    def calculate_graph_quantization_params(self):
         if self.tensors_range is None:
             return
 
-        # adjust tensor_ranges for input of Clip and Relu node
-        for node in self.model.nodes():
-            if node.op_type not in ["Clip", "Relu"]:
-                continue
-            if self.is_activation_symmetric:
-                continue
-            if not self.should_quantize_node(node):
-                continue
-            if len(self.model.input_name_to_nodes()[node.input[0]]) != 1:
-                continue
-            if node.input[0] not in self.tensors_range or node.output[0] not in self.tensors_range:
-                continue
-            td = self.tensors_range[node.output[0]]
-            if not isinstance(td, TensorData):
-                raise TypeError(f"Unexpected type {type(td)} for {node.output[0]!r}.")
-            self.tensors_range[node.input[0]] = td
+        self.adjust_tensor_ranges(softmax_0_to_1=True)
 
         quantization_params = {}
         for tensor_name in self.tensors_range:
@@ -756,25 +802,16 @@ class QDQQuantizer(BaseQuantizer):
                 raise TypeError(f"Unexpected type {type(td)} for {tensor_name!r}.")
 
             quant_overrides = self.get_per_tensor_quant_overrides(tensor_name)
+            original = self.calculate_quantization_params(quant_overrides)
+            converted = None
+            converted_recv_nodes = None
+            
+            if "convert" in quant_overrides:
+                converted = self.calculate_quantization_params(quant_overrides["convert"])
+                converted_recv_nodes = quant_overrides["convert"].get("recv_nodes")
 
-            quant_type = self.activation_qType
-            if "quant_type" in quant_overrides:
-                quant_type = quant_overrides["quant_type"].tensor_type
-
-            if "scale" in quant_overrides and "zero_point" in quant_overrides:
-                zero, scale = quant_overrides["zero_point"], quant_overrides["scale"]
-            elif quant_type == onnx.TensorProto.FLOAT8E4M3FN:
-                zero, scale = compute_scale_zp_float8(quant_type, td.avg_std[1])
-            else:
-                rmin = quant_overrides.get("rmin", td.range_value[0])
-                rmax = quant_overrides.get("rmax", td.range_value[1])
-                symmetric = quant_overrides.get("symmetric", self.is_activation_symmetric)
-                reduce_range = quant_overrides.get("reduce_range", False)
-                qmin, qmax = get_qmin_qmax_for_qType(quant_type, reduce_range=reduce_range, symmetric=symmetric)
-                zero, scale = compute_scale_zp(rmin, rmax, qmin, qmax, symmetric, self.min_real_range)
-
-            quantization_params[tensor_name] = QuantizationParamsTmp(
-                zero_point=zero, scale=scale, quant_type=quant_type
+            quantization_params[tensor_name] = QDQTensorQuantParams(
+                original, converted, converted_recv_nodes
             )
 
         return quantization_params
