@@ -114,10 +114,6 @@ Status QnnModel::ComposeGraph(const GraphViewer& graph_viewer,
     return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Failed to initialize qnn_model_wrapper.");
   }
 
-  auto get_const_initializer = [&graph_viewer](const std::string& initializer_name) {
-    return graph_viewer.GetConstantInitializer(initializer_name, true);
-  };
-
   std::unordered_set<const NodeUnit*> handled_node_units;
 
   // Op builer
