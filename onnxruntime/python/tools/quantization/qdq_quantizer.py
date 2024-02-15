@@ -572,7 +572,9 @@ class QDQQuantizer(BaseQuantizer):
             self.model.replace_output_of_all_nodes(tensor_name, first_q_input)
 
         first_q_output = add_quant_output_suffix(tensor_name)
-        self._create_q_node(first_q_input, first_q_output, add_quant_suffix(tensor_name))
+        self._create_q_node(
+            first_q_input, first_q_output, add_quant_suffix(tensor_name), first_scale_name, first_zp_name
+        )
 
         # Create first DQ op.
         first_dq_output = add_dequant_output_suffix(tensor_name)
@@ -581,7 +583,9 @@ class QDQQuantizer(BaseQuantizer):
         if original_recv_nodes and first_dq_output != tensor_name:
             self.model.replace_input_of_nodes(tensor_name, first_dq_output, original_recv_nodes)
 
-        self._create_dq_node(first_q_output, first_dq_output, add_dequant_suffix(tensor_name))
+        self._create_dq_node(
+            first_q_output, first_dq_output, add_dequant_suffix(tensor_name), first_scale_name, first_zp_name
+        )
 
         # Create parallel clone of first DQ op if some nodes use the original quantized type.
         # This DQ clone would only have one consumer Q node and could be potentially fused with
@@ -589,11 +593,23 @@ class QDQQuantizer(BaseQuantizer):
         second_q_input = first_dq_output
         if not all_use_converted:
             second_q_input = add_quant_input_suffix(f"{tensor_name}_convert")
-            self._create_dq_node(first_q_output, second_q_input, add_dequant_suffix(f"{tensor_name}_convert_clone"))
+            self._create_dq_node(
+                first_q_output,
+                second_q_input,
+                add_dequant_suffix(f"{tensor_name}_convert_clone"),
+                first_scale_name,
+                first_zp_name,
+            )
 
         # Create second Q op.
         second_q_output = add_quant_output_suffix(f"{tensor_name}_convert")
-        self._create_q_node(second_q_input, second_q_output, add_quant_suffix(f"{tensor_name}_convert"))
+        self._create_q_node(
+            second_q_input,
+            second_q_output,
+            add_quant_suffix(f"{tensor_name}_convert"),
+            convert_scale_name,
+            convert_zp_name,
+        )
 
         # Create second DQ op.
         second_dq_output = add_dequant_output_suffix(f"{tensor_name}_convert")
@@ -601,6 +617,13 @@ class QDQQuantizer(BaseQuantizer):
             second_dq_output = tensor_name
         if convert_recv_nodes and second_dq_output != tensor_name:
             self.model.replace_input_of_nodes(tensor_name, second_dq_output, convert_recv_nodes)
+        self._create_dq_node(
+            second_q_output,
+            second_dq_output,
+            add_dequant_suffix(f"{tensor_name}_convert"),
+            convert_scale_name,
+            convert_zp_name,
+        )
 
         # Store in quantized_value_map
         original_quantized_value = QuantizedValue(
@@ -635,6 +658,11 @@ class QDQQuantizer(BaseQuantizer):
                     self._add_qdq_pair_for_initializer(initializer, tensor_info.tensor_type, tensor_info.axis)
                 else:
                     quant_params_initializers = self._create_quantization_initializers(tensor_name)
+                    if not quant_params_initializers:
+                        raise ValueError(
+                            f"Quantization parameters are not specified for param {tensor_name}. "
+                            "In static mode quantization params for inputs and outputs of nodes to be quantized are required."
+                        )
 
                     if quant_params_initializers.converted is None:
                         self._add_qdq_pair_for_activation(
@@ -890,7 +918,7 @@ class QDQQuantizer(BaseQuantizer):
 
         return QDQQuantParamsInitializers(init_scale, init_zp)
 
-    def _create_quantization_initializers(self, param_name: str) -> QDQTensorQuantParamsInitializers:
+    def _create_quantization_initializers(self, param_name: str) -> QDQTensorQuantParamsInitializers | None:
         """
         Create initializers and inputs in the graph for zero point and scale of output.
         Zero point and scale values are obtained from self.quantization_params.
@@ -899,7 +927,7 @@ class QDQQuantizer(BaseQuantizer):
         """
         if self.quantization_params is None or param_name not in self.quantization_params:
             logging.info(f'Quantization parameters for tensor:"{param_name}" not specified')
-            return False, "", "", "", ""
+            return None
 
         tensor_params = self.quantization_params[param_name]
         if not isinstance(tensor_params, QDQTensorQuantParams):
