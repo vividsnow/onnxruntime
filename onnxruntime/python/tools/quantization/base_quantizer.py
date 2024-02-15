@@ -22,8 +22,6 @@ from .quant_utils import (
     ONNX_TYPE_TO_NP_TYPE,
     TENSOR_NAME_QUANT_SUFFIX,
     QuantType,
-    compute_scale_zp,
-    compute_scale_zp_float8,
     find_by_name,
     model_has_infer_metadata,
     quantize_data,
@@ -532,4 +530,3 @@ class BaseQuantizer:
             # Optionally, adjust Softmax to range from 0.0 to 1.0
             elif node.op_type == "Softmax" and softmax_0_to_1:
                 self.tensors_range[node.output[0]] = TensorData(lowest=np.float32(0.0), highest=np.float32(1.0))
-

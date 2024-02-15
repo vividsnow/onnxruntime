@@ -1,18 +1,8 @@
-import numpy as np
 import onnx
 import onnx.helper
 
-from ..quant_utils import (
-    TENSOR_NAME_QUANT_SUFFIX,
-    QuantizedValue,
-    QuantizedValueType,
-    attribute_to_kwarg,
-    compute_scale_zp,
-    get_qmin_qmax_for_qType,
-    ms_domain,
-)
+from ..quant_utils import TENSOR_NAME_QUANT_SUFFIX, QuantizedValue, QuantizedValueType, attribute_to_kwarg, ms_domain
 from .base_operator import QuantOperatorBase
-from .qdq_base_operator import QDQOperatorBase
 
 
 class QLinearSoftmax(QuantOperatorBase):
