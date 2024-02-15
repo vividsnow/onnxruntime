@@ -360,8 +360,22 @@ def get_qnn_qdq_config(
         "TensorQuantOverrides": tensor_quant_overrides,
     }
 
+    overrides_have_int16 = False
+    if tensor_quant_overrides:
+        for quant_overrides_list in tensor_quant_overrides.values():
+            for quant_overrides in quant_overrides_list:
+                if quant_overrides.get("quant_type") in Q16_TYPES:
+                    overrides_have_int16 = True
+                    break
+
+                if "convert" in quant_overrides and quant_overrides["convert"].get("quant_type") in Q16_TYPES:
+                    overrides_have_int16 = True
+                    break
+            if overrides_have_int16:
+                break
+
     # TODO: Remove this extra option once ORT uses an ONNX version that supports 16-bit Q/DQ ops.
-    if activation_type in Q16_TYPES or weight_type in Q16_TYPES:
+    if activation_type in Q16_TYPES or weight_type in Q16_TYPES or overrides_have_int16:
         extra_options["UseQDQContribOps"] = True
 
     return StaticQuantConfig(
