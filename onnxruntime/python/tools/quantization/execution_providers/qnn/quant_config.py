@@ -194,10 +194,11 @@ def _add_qtype_converts(
 
         override = override_list[0]
         quant_type = override.get("quant_type", activation_type)
-        producer_node = producers[tensor_name]
+        producer_node = producers.get(tensor_name)  # None if this is a model input
 
         if quant_type != activation_type and "convert" not in override:
-            _add_node_io_type_requests(type_requests, quant_type, producer_node, value_infos, name_to_initializer)
+            if producer_node is not None:
+                _add_node_io_type_requests(type_requests, quant_type, producer_node, value_infos, name_to_initializer)
 
             # Find all consumer nodes of `tensor_name` and update their inputs/outputs to the new type.
             for consumer_node in consumers[tensor_name]:
