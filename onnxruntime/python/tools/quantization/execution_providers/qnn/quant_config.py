@@ -152,8 +152,10 @@ def _add_node_io_type_requests(type_requests, quant_type, node, value_infos, nam
         if output_name not in type_requests:
             type_requests[output_name] = TensorTypeRequest(quant_type, None)
         else:
-            if (type_requests[output_name].producer_type is not None and
-                type_requests[output_name].producer_type != quant_type):
+            if (
+                type_requests[output_name].producer_type is not None
+                and type_requests[output_name].producer_type != quant_type
+            ):
                 raise ValueError(f"Tensor {output_name} has multiple types.")
 
             type_requests[output_name].producer_type = quant_type
@@ -174,7 +176,11 @@ def _add_node_io_type_requests(type_requests, quant_type, node, value_infos, nam
             if type_requests[input_name].consumers[0] != quant_type:
                 raise ValueError(f"Tensor {input_name} has consumers requesting different types.")
 
+            if not node.name:
+                raise ValueError(f"Node of type {node.op_type} with output 0 {node.output[0]} does not have a name!")
+
             type_requests[input_name].consumers[1].add(node.name)
+
 
 def _add_qtype_converts(
     tensor_quant_overrides, activation_type, value_infos, name_to_initializer, producers, consumers
@@ -206,14 +212,17 @@ def _add_qtype_converts(
 
     # Process type requests.
     for tensor_name, type_req in type_requests.items():
+        has_producer_req = type_req.producer_type is not None
+        has_consumer_req = bool(type_req.consumers)
+
         # Only producer type: Add conversion back to default activation type
-        if (type_req.producer_type is not None) and not type_req.consumers:
+        if has_producer_req and not has_consumer_req:
             if tensor_name not in tensor_quant_overrides:
                 tensor_quant_overrides[tensor_name] = [{"quant_type": type_req.producer_type}]
 
             tensor_quant_overrides[tensor_name][0]["convert"] = {"quant_type": activation_type}
         # Only consumers
-        elif type_req.producer_type is None:
+        elif not has_producer_req and has_consumer_req:
             prod_type = _get_output_activation_qtype(tensor_name, tensor_quant_overrides, activation_type)
             consumer_type = type_req.consumers[0]
 
@@ -224,10 +233,10 @@ def _add_qtype_converts(
             else:
                 if not _check_not_in_convert_recv_nodes(tensor_quant_overrides, tensor_name, type_req.consumers[1]):
                     raise ValueError(
-                        "Tensor override for '{tensor_name}' converts the type for consumers that need the original type."
+                        f"Tensor override for '{tensor_name}' converts the type for consumers that need the original type."
                     )
         # Both producer and consumers
-        else:
+        elif has_producer_req and has_consumer_req:
             prod_type = type_req.producer_type
             consumer_type = type_req.consumers[0]
 
@@ -241,12 +250,18 @@ def _add_qtype_converts(
 
                 if len(consumers_for_original_type) == 0:
                     # All consumers want the overridden type, so no need for convert nodes!
+                    # Just add the override to the new new if not already present.
+                    if tensor_name not in tensor_quant_overrides:
+                        tensor_quant_overrides[tensor_name] = [{"quant_type": prod_type}]
+
                     assert "convert" not in tensor_quant_overrides[tensor_name][0]
                 else:
                     # Some consumers don't want the overridden type.
                     _add_to_convert_recv_nodes(
                         tensor_quant_overrides, tensor_name, prod_type, activation_type, consumers_for_original_type
                     )
+        else:
+            raise ValueError(f"TypeRequest for tensor {tensor_name} has no producer or consumers.")
 
 
 def get_qnn_qdq_config(

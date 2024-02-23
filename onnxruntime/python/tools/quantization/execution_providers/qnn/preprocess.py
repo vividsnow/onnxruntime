@@ -44,6 +44,14 @@ def qnn_preprocess_model(model_input: Path, model_output: Path, fuse_layernorm: 
             if fusion_layernorm.apply():
                 modified = True
 
+    # Make sure all nodes have a name
+    for node in onnx_model.model.graph.node:
+        if not node.name:
+            node_name = f"{node.op_type}_qnn_preproc_{node.output[0]}"
+            logging.warning(f"Node of type {node.op_type} does not have a name. Renaming to {node_name}.")
+            node.name = node_name
+            modified = True
+
     if modified:
         onnx_model.topological_sort()
         onnx.save_model(model, model_output)
