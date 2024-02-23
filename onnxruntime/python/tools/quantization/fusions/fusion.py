@@ -76,7 +76,7 @@ class Fusion:
 
             self._new_node_name_suffix = suffix
 
-        new_name = f"{prefix}_{self._new_node_name_suffix!s}"
+        new_name = f"{prefix}{self._new_node_name_suffix!s}"
         self._new_node_name_suffix += 1
 
         return new_name
