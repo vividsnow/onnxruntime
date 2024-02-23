@@ -46,7 +46,7 @@ def qnn_preprocess_model(model_input: Path, model_output: Path, fuse_layernorm: 
 
     # Make sure all nodes have a name
     for node in onnx_model.model.graph.node:
-        if not node.name:
+        if node.op_type != "Constant" and not node.name:
             node_name = f"{node.op_type}_qnn_preproc_{node.output[0]}"
             logging.warning(f"Node of type {node.op_type} does not have a name. Renaming to {node_name}.")
             node.name = node_name
