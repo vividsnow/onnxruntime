@@ -19,6 +19,7 @@ from ...quantize import StaticQuantConfig
 Q16_TYPES = {QuantType.QInt16, QuantType.QUInt16}
 Q8_TYPES = {QuantType.QInt8, QuantType.QUInt8}
 OP_TYPES_TO_EXCLUDE = {"Cast"}
+MODEL_SIZE_THRESHOLD = 2147483648  # Quant model should use external data if >= 2GB
 
 
 def _is_tensor_quantizable(tensor_name, value_infos, name_to_initializer):
@@ -277,12 +278,22 @@ def get_qnn_qdq_config(
     if per_channel:
         raise ValueError("QNN EP does not yet support per-channel quantization.")
 
-    # Process model nodes to setup overrides.
-    model = onnx.load_model(model_input)
+    model = onnx.load_model(model_input, load_external_data=False)
+
     op_types = set()
     consumers = {}
     producers = {}
-    name_to_initializer = {initializer.name: initializer for initializer in model.graph.initializer}
+    tensor_quant_overrides = {}
+    model_has_external_data = False
+    name_to_initializer = {}
+
+    # Build map of initializers (name -> initializer) and
+    # check if the model has external data.
+    for initializer in model.graph.initializer:
+        name_to_initializer[initializer.name] = initializer
+        if onnx.external_data_helper.uses_external_data(initializer):
+            model_has_external_data = True
+
     value_infos = {vi.name: vi for vi in model.graph.value_info}
     value_infos.update({ot.name: ot for ot in model.graph.output})
     value_infos.update({it.name: it for it in model.graph.input})
@@ -311,6 +322,7 @@ def get_qnn_qdq_config(
             tensor_quant_overrides, activation_type, value_infos, name_to_initializer, producers, consumers
         )
 
+    # Setup quantization overrides for specific operator types
     for node in model.graph.node:
         if node.op_type == "MatMul" and weight_type in Q8_TYPES:
             weight_symmetric = weight_type == QuantType.QInt8
@@ -415,5 +427,6 @@ def get_qnn_qdq_config(
         activation_type=activation_type,
         weight_type=weight_type,
         op_types_to_quantize=list(op_types.difference(OP_TYPES_TO_EXCLUDE)),
+        use_external_data_format=(model_has_external_data or model.ByteSize() >= MODEL_SIZE_THRESHOLD),
         extra_options=extra_options,
     )

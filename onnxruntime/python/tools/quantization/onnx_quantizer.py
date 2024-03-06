@@ -552,8 +552,7 @@ class ONNXQuantizer(BaseQuantizer):
                 raise ValueError(f"Unexpected type {type(params['scale'])} and param_name={param_name!r}")
             scale_values = np.array([params["scale"]])
             assert scale_values.dtype != np.float64
-            # zero_point_type = params["quant_type"]
-            assert zero_point_type == params["quant_type"]
+            zero_point_type = params["quant_type"]
         else:
             zero_point_values = np.array([use_zeropoint])
             scale_values = np.array([use_scale])

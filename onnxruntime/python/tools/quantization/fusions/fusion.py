@@ -64,17 +64,8 @@ class Fusion:
         prefix = self._new_node_name_prefix
 
         if self._new_node_name_suffix is None:
-            suffix: int = 0
-
-            for node in self.model.nodes():
-                if node.name and node.name.startswith(prefix):
-                    try:
-                        index = int(node.name[len(prefix) :])
-                        suffix = max(index + 1, suffix)
-                    except ValueError:
-                        continue
-
-            self._new_node_name_suffix = suffix
+            largest_suffix: int = self.model.get_largest_node_name_suffix(prefix)
+            self._new_node_name_suffix = largest_suffix + 1
 
         new_name = f"{prefix}{self._new_node_name_suffix!s}"
         self._new_node_name_suffix += 1
