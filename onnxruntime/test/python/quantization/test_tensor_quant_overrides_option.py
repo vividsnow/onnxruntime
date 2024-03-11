@@ -73,6 +73,7 @@ class TestTensorQuantOverridesOption(unittest.TestCase):
             [sigmoid_node, conv_node], "test", [inp], [out], initializer=[wgt_init, bias_init]
         )
         model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 13)])
+        model = onnx.shape_inference.infer_shapes(model)
         onnx.save(model, "model.onnx")
 
     def perform_qdq_quantization(self, output_model_name, extra_options=None, per_channel=False, activation_type=None):
@@ -604,6 +605,7 @@ class TestTensorQuantOverridesOption(unittest.TestCase):
             graph,
             opset_imports=[onnx.helper.make_opsetid("", 18)],
         )
+        model = onnx.shape_inference.infer_shapes(model)
         onnx.save_model(
             model,
             "add_ext_data.onnx",

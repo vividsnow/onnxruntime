@@ -200,10 +200,12 @@ def get_qnn_qdq_config(
                 if not did_update:
                     warn_unable_to_override(node, "quant_type/scale/zero_point", node.output[0], "output")
 
-    if not overrides_helper.is_valid(set(name_to_initializer), set(value_infos)):
+    valid, err = overrides_helper.is_valid(set(name_to_initializer), set(value_infos))
+
+    if not valid:
         pprint_overrides = overrides_helper.pprint_str(indent=4)
         logging.error(f"Invalid tensor quantization overrides:\n{pprint_overrides}")
-        raise ValueError("Unable to generate valid tensor quantization overrides")
+        raise ValueError(err)
 
     extra_options = {
         "MinimumRealRange": 0.0001,
