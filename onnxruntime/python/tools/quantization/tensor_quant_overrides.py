@@ -5,8 +5,10 @@
 # --------------------------------------------------------------------------
 from __future__ import annotations
 
+import json
 from collections.abc import MutableMapping
 from dataclasses import dataclass
+from typing import Any
 
 import onnx
 
@@ -16,13 +18,40 @@ from .quant_utils import QuantType
 class TensorQuantOverridesHelper(MutableMapping):
     def __init__(
         self,
-        raw_overrides: dict[str, list[dict]],
+        raw_overrides: dict[str, list[dict[str, Any]]],
         default_activation_qtype: QuantType,
         default_weight_qtype: QuantType,
     ):
         self.overrides = raw_overrides
         self.default_activation_qtype = default_activation_qtype
         self.default_weight_qtype = default_weight_qtype
+        self.quant_types = None
+
+    def get_per_tensor_quant_overrides(self, tensor_name: str) -> dict[str, Any]:
+        overrides_list = self.overrides.get(tensor_name, [{}])
+        num_overrides = len(overrides_list)
+        if num_overrides > 1:
+            raise ValueError(
+                f"Expected tensor '{tensor_name}' to use per-tensor quantization overrides, "
+                f"but found {num_overrides} per-channel overrides."
+            )
+
+        return overrides_list[0] if num_overrides > 0 else {}
+
+    def get_per_channel_quant_overrides(
+        self,
+        tensor_name: str,
+        num_channels: int,
+    ) -> list[dict[str, Any]]:
+        overrides_list = self.overrides.get(tensor_name, [{} for i in range(num_channels)])
+
+        if len(overrides_list) != num_channels:
+            raise ValueError(
+                f"Expected tensor '{tensor_name}' to have {num_channels} per-channel quantization overrides, "
+                f"but found {len(overrides_list)} instead."
+            )
+
+        return overrides_list
 
     def get_node_output_qtype(self, output_name: str):
         if output_name not in self.overrides:
@@ -57,11 +86,11 @@ class TensorQuantOverridesHelper(MutableMapping):
     def update_tensor_overrides(
         self,
         tensor_name: str,
+        new_vals: dict[str, Any],
         channels: list[int] | None = None,
         overwrite: bool = True,
-        **kwargs,
     ) -> bool:
-        if not kwargs:
+        if not new_vals:
             return False
 
         channels = set(channels) if channels is not None else None
@@ -73,7 +102,7 @@ class TensorQuantOverridesHelper(MutableMapping):
             for channel, overrides in enumerate(self.overrides[tensor_name]):
                 if channels is not None and channel not in channels:
                     continue
-                if set(kwargs).intersection(set(overrides)):
+                if set(new_vals).intersection(set(overrides)):
                     do_update = False
                     break
 
@@ -85,7 +114,7 @@ class TensorQuantOverridesHelper(MutableMapping):
             for channel, overrides in enumerate(self.overrides[tensor_name]):
                 if channels is not None and channel not in channels:
                     continue
-                overrides.update(kwargs)
+                overrides.update(new_vals)
 
         return do_update
 
@@ -124,6 +153,124 @@ class TensorQuantOverridesHelper(MutableMapping):
             return False
 
         return not convert_dict["recv_nodes"].intersection(node_names)
+
+    def get_quant_types(self) -> set[QuantType]:
+        if self.quant_types is not None:
+            return self.quant_types
+
+        self.quant_types = set()
+
+        if self.overrides:
+            for quant_overrides_list in self.overrides.values():
+                for quant_overrides in quant_overrides_list:
+                    if "quant_type" in quant_overrides:
+                        self.quant_types.add(quant_overrides["quant_type"])
+
+                    if "convert" in quant_overrides and "quant_type" in quant_overrides["convert"]:
+                        self.quant_types.add(quant_overrides["convert"]["quant_type"])
+
+        return self.quant_types
+
+    def is_valid(self, initializer_names: set[str], activation_names: set[str]):
+        self.quant_types = set()
+
+        # Validate that compatible/valid overrides are provided.
+        if self.overrides:
+            keys_unsupported_with_scale_zp = {"symmetric", "reduce_range", "rmax", "rmin"}
+
+            for tensor_name, quant_overrides_list in self.overrides.items():
+                if tensor_name not in initializer_names and tensor_name not in activation_names:
+                    raise ValueError(f"Tensor '{tensor_name}' in TensorQuantOverrides is not present in the model")
+
+                if not isinstance(quant_overrides_list, list):
+                    raise ValueError(f"Tensor quantization overrides for '{tensor_name}' are not in a list")
+
+                is_initializer = tensor_name in initializer_names
+                if not is_initializer and len(quant_overrides_list) > 1:
+                    raise ValueError(
+                        f"Tensor '{tensor_name}' has a list of per-channel overrides, but is not an initializer"
+                    )
+
+                quant_type = None
+                for index, quant_overrides in enumerate(quant_overrides_list):
+                    if not isinstance(quant_overrides, dict):
+                        raise ValueError(
+                            f"Tensor quantization overrides at index {index} for '{tensor_name}' are not in a dict"
+                        )
+
+                    # For per-channel quantization, all channels must use the same quantization type.
+                    # Therefore, if the user tries to override the quant_type for a channel, it must match in all
+                    # other channels.
+                    if index == 0:
+                        quant_type = quant_overrides.get("quant_type")
+                        if quant_type:
+                            self.quant_types.add(quant_type)
+                    elif quant_type != quant_overrides.get("quant_type"):
+                        raise ValueError(
+                            "Channel quantization types for tensor '{tensor_name}' do not match at index {index}."
+                        )
+
+                    has_scale = "scale" in quant_overrides
+                    has_zero_point = "zero_point" in quant_overrides
+
+                    if (has_scale and not has_zero_point) or (has_zero_point and not has_scale):
+                        raise ValueError(
+                            "Must provide both 'scale' and 'zero_point' if one of the overrides is provided"
+                        )
+
+                    if has_scale:
+                        for key in keys_unsupported_with_scale_zp:
+                            if key in quant_overrides:
+                                raise ValueError(
+                                    f"Tensor override option '{key}' is invalid with 'scale' and 'zero_point'"
+                                )
+
+                    if "convert" in quant_overrides:
+                        if index > 0:
+                            raise ValueError(
+                                f"Per-channel overrides (tensor '{tensor_name}') do not support 'convert'."
+                            )
+
+                        if is_initializer:
+                            raise ValueError("Cannot use 'convert' override for initializers")
+
+                        if "quant_type" not in quant_overrides["convert"]:
+                            raise ValueError(f"'convert' options (tensor '{tensor_name}') must specify a 'quant_type'")
+
+                        convert_quant_type = quant_overrides["convert"]["quant_type"]
+                        original_quant_type = quant_type if quant_type is not None else self.default_activation_qtype
+                        if convert_quant_type == original_quant_type:
+                            raise ValueError(
+                                f"'convert' quant_type must differ from original quant_type (tensor '{tensor_name}')"
+                            )
+
+                        convert_has_scale = "scale" in quant_overrides["convert"]
+                        convert_has_zero_point = "zero_point" in quant_overrides["convert"]
+
+                        if (convert_has_scale and not convert_has_zero_point) or (
+                            convert_has_zero_point and not convert_has_scale
+                        ):
+                            raise ValueError(
+                                f"Must provide both 'scale' and 'zero_point' if one of the overrides is provided (tensor '{tensor_name}')"
+                            )
+
+                        if convert_has_scale:
+                            for key in keys_unsupported_with_scale_zp:
+                                if key in quant_overrides["convert"]:
+                                    raise ValueError(
+                                        f"Tensor override option '{key}' is invalid with 'scale' and 'zero_point' (tensor '{tensor_name}')"
+                                    )
+
+                        self.quant_types.add(convert_quant_type)
+
+    def pprint_str(self, indent=None) -> str:
+        return json.dumps(self.overrides, default=str, indent=indent)
+
+    def empty(self) -> bool:
+        return len(self.overrides) > 0
+
+    def get_dict(self) -> dict[str, list[dict[str, Any]]]:
+        return self.overrides
 
     # Required implementations of abstract methods in collections.abc.MutableMapping
     # so that this class can be used like a dict.
@@ -202,15 +349,15 @@ class MixedPrecisionTensorQuantOverridesFixer:
         # Use type requests to "fix" tensor quantization overrides by adding
         # quantization type conversions where necessary.
         for tensor_name, type_req in type_requests.items():
+            all_consumers = set([node.name for node in self.consumers[tensor_name]])
             has_producer_req = type_req.producer_type is not None
             has_consumer_req = bool(type_req.consumers)
 
             # Only producer type: Add conversion back to default activation type
             if has_producer_req and not has_consumer_req:
-                if tensor_name not in self.overrides:
-                    self.overrides[tensor_name] = [{"quant_type": type_req.producer_type}]
-
-                self.overrides[tensor_name][0]["convert"] = {"quant_type": default_activation_qtype}
+                self.overrides.update_converted_tensor(
+                    tensor_name, type_req.producer_type, default_activation_qtype, all_consumers
+                )
             # Only consumers
             elif not has_producer_req and has_consumer_req:
                 prod_type = self.overrides.get_node_output_qtype(tensor_name)
@@ -231,7 +378,6 @@ class MixedPrecisionTensorQuantOverridesFixer:
                 if prod_type != consumer_type:
                     self.overrides.update_converted_tensor(tensor_name, prod_type, consumer_type, type_req.consumers[1])
                 else:
-                    all_consumers = set([node.name for node in self.consumers[tensor_name]])
                     consumers_for_original_type = all_consumers.difference(type_req.consumers[1])
 
                     if len(consumers_for_original_type) == 0:
