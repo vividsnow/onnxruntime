@@ -5,15 +5,15 @@
 # license information.
 # --------------------------------------------------------------------------
 
-import math
 import unittest
 
-import numpy as np
 import onnx
 
-import onnxruntime
 from onnxruntime.quantization import QuantType
-from onnxruntime.quantization.tensor_quant_overrides import TensorQuantOverridesHelper, MixedPrecisionTensorQuantOverridesFixer
+from onnxruntime.quantization.tensor_quant_overrides import (
+    MixedPrecisionTensorQuantOverridesFixer,
+    TensorQuantOverridesHelper,
+)
 
 
 class TestMixedPrecisionQuantOverridesFixer(unittest.TestCase):
@@ -67,6 +67,6 @@ class TestMixedPrecisionQuantOverridesFixer(unittest.TestCase):
         fixer = MixedPrecisionTensorQuantOverridesFixer.create_from_model(overrides, model)
         fixer.apply()
 
-        print(overrides)
+        print(overrides.pprint_str())
 
         self.assertTrue(True)
