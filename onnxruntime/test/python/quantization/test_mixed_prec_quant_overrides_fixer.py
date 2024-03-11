@@ -67,6 +67,16 @@ class TestMixedPrecisionQuantOverridesFixer(unittest.TestCase):
         fixer = MixedPrecisionTensorQuantOverridesFixer.create_from_model(overrides, model)
         fixer.apply()
 
-        print(overrides.pprint_str())
-
-        self.assertTrue(True)
+        expected = {
+            "op4_out": [{"quant_type": QuantType.QUInt16}],
+            "op2_out": [
+                {"quant_type": QuantType.QUInt8, "convert": {"quant_type": QuantType.QUInt16, "recv_nodes": {"op4"}}}
+            ],
+            "op5_out": [
+                {"quant_type": QuantType.QUInt16, "convert": {"quant_type": QuantType.QUInt8, "recv_nodes": {"op6"}}}
+            ],
+            "op3_out": [
+                {"quant_type": QuantType.QUInt8, "convert": {"quant_type": QuantType.QUInt16, "recv_nodes": {"op5"}}}
+            ],
+        }
+        self.assertEqual(overrides.get_dict(), expected)
