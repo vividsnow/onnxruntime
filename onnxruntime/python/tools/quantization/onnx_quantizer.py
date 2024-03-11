@@ -4,14 +4,13 @@
 # license information.
 # --------------------------------------------------------------------------
 import logging
-from typing import Any, Dict
 
 import numpy as np
 import onnx
 import onnx.numpy_helper
 from onnx import onnx_pb as onnx_proto
 
-from .base_quantizer import BaseQuantizer
+from .base_quantizer import BaseQuantizer, QuantizationParams
 from .calibrate import TensorData
 from .onnx_model import ONNXModel
 from .quant_utils import (
@@ -33,28 +32,6 @@ from .quant_utils import (
     tensor_proto_to_array,
 )
 from .registry import CreateOpQuantizer
-
-
-class QuantizationParams:
-    def __init__(self, **data: Dict[str, Any]):
-        self.data = {}
-        for k, v in data.items():
-            if not isinstance(k, str):
-                raise TypeError(f"Keys must be strings not {type(k)} for k={k!r}.")
-            if not isinstance(v, (int, str, np.ndarray)):
-                raise TypeError(f"Values must be numpy arrays, int, float, str not {type(v)} for k={k!r}.")
-            if k == "scale" and v.dtype not in (np.float32, np.float16):
-                raise ValueError(f"scale must a float32 or float16 numpy element but is {v.dtype} for k={k!r}")
-            self.data[k] = v
-
-    def __iter__(self):
-        yield from self.data
-
-    def __getitem__(self, key):
-        return self.data[key]
-
-    def __len__(self):
-        return len(self.data)
 
 
 class ONNXQuantizer(BaseQuantizer):

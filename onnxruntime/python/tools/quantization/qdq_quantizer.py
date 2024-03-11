@@ -8,7 +8,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
 
 import numpy as np
 import onnx
@@ -16,7 +15,7 @@ import onnx.numpy_helper
 from onnx import TensorProto
 from onnx import onnx_pb as onnx_proto
 
-from .base_quantizer import BaseQuantizer
+from .base_quantizer import BaseQuantizer, QuantizationParams
 from .calibrate import TensorData
 from .quant_utils import (
     DEQUANT_OP_NAME,
@@ -62,33 +61,10 @@ class QDQTensorQuantInfo:
         self.data_type = data_type
 
 
-# TODO: Move to base_quantizer.py?
-class QuantizationParamsTmp:
-    def __init__(self, **data: dict[str, Any]):
-        self.data = {}
-        for k, v in data.items():
-            if not isinstance(k, str):
-                raise TypeError(f"Keys must be strings not {type(k)} for k={k!r}.")
-            if not isinstance(v, (int, str, np.ndarray)):
-                raise TypeError(f"Values must be numpy arrays, int, float, str not {type(v)} for k={k!r}.")
-            if k == "scale" and v.dtype not in (np.float32, np.float16):
-                raise ValueError(f"scale must a float32 or float16 numpy element but is {v.dtype} for k={k!r}")
-            self.data[k] = v
-
-    def __iter__(self):
-        yield from self.data
-
-    def __getitem__(self, key):
-        return self.data[key]
-
-    def __len__(self):
-        return len(self.data)
-
-
 @dataclass
 class QDQTensorQuantParams:
-    original: QuantizationParamsTmp
-    converted: QuantizationParamsTmp | None
+    original: QuantizationParams
+    converted: QuantizationParams | None
     converted_recv_nodes: set[str] | None
 
 
@@ -888,7 +864,7 @@ class QDQQuantizer(BaseQuantizer):
         return quantized_bias_name
 
     def __make_initializers(
-        self, param_name: str, params: QuantizationParamsTmp, init_name_suffix: str = ""
+        self, param_name: str, params: QuantizationParams, init_name_suffix: str = ""
     ) -> QDQQuantParamsInitializers:
         zero_point_values = np.array([params["zero_point"]])
         if not hasattr(params["scale"], "dtype") or params["scale"].dtype not in (np.float32, np.float16):
@@ -943,7 +919,7 @@ class QDQQuantizer(BaseQuantizer):
 
         return QDQTensorQuantParamsInitializers(original_inits, converted_inits, tensor_params.converted_recv_nodes)
 
-    def calculate_quantization_params(self, tensor_data: TensorData, quant_overrides) -> QuantizationParamsTmp:
+    def calculate_quantization_params(self, tensor_data: TensorData, quant_overrides) -> QuantizationParams:
         quant_type = self.activation_qType
         if "quant_type" in quant_overrides:
             quant_type = quant_overrides["quant_type"].tensor_type
@@ -960,7 +936,7 @@ class QDQQuantizer(BaseQuantizer):
             qmin, qmax = get_qmin_qmax_for_qType(quant_type, reduce_range=reduce_range, symmetric=symmetric)
             zero, scale = compute_scale_zp(rmin, rmax, qmin, qmax, symmetric, self.min_real_range)
 
-        return QuantizationParamsTmp(zero_point=zero, scale=scale, quant_type=quant_type)
+        return QuantizationParams(zero_point=zero, scale=scale, quant_type=quant_type)
 
     def calculate_graph_quantization_params(self):
         if self.tensors_range is None:

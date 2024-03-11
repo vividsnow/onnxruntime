@@ -5,15 +5,25 @@
 # license information.
 # --------------------------------------------------------------------------
 
+import os
 import struct
 import unittest
 
 import numpy as np
 import onnx
 
-from onnxruntime import quantization
-from onnxruntime.quantization.execution_providers.qnn import get_qnn_qdq_config
-from onnxruntime.quantization.quant_utils import compute_scale_zp, get_qmin_qmax_for_qType, ms_domain
+if os.environ.get("LOCAL_IMPORT") == "1":
+    # Allow running this test script without installing onnxruntime package.
+    import sys
+
+    sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "..", "python", "tools"))
+    import quantization
+    from quantization.execution_providers.qnn import get_qnn_qdq_config
+    from quantization.quant_utils import compute_scale_zp, get_qmin_qmax_for_qType, ms_domain
+else:
+    from onnxruntime import quantization
+    from onnxruntime.quantization.execution_providers.qnn import get_qnn_qdq_config
+    from onnxruntime.quantization.quant_utils import compute_scale_zp, get_qmin_qmax_for_qType, ms_domain
 
 
 class DummyDataReader(quantization.CalibrationDataReader):
@@ -73,7 +83,6 @@ class TestTensorQuantOverridesOption(unittest.TestCase):
             [sigmoid_node, conv_node], "test", [inp], [out], initializer=[wgt_init, bias_init]
         )
         model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 13)])
-        model = onnx.shape_inference.infer_shapes(model)
         onnx.save(model, "model.onnx")
 
     def perform_qdq_quantization(self, output_model_name, extra_options=None, per_channel=False, activation_type=None):
@@ -605,7 +614,6 @@ class TestTensorQuantOverridesOption(unittest.TestCase):
             graph,
             opset_imports=[onnx.helper.make_opsetid("", 18)],
         )
-        model = onnx.shape_inference.infer_shapes(model)
         onnx.save_model(
             model,
             "add_ext_data.onnx",

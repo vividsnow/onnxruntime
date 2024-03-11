@@ -5,6 +5,7 @@
 # license information.
 # --------------------------------------------------------------------------
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,8 +21,16 @@ from op_test_utils import (
     create_clip_node,
 )
 
-from onnxruntime.quantization import QDQQuantizer, QuantFormat, QuantType, quantize_static
-from onnxruntime.quantization.calibrate import TensorData
+if os.environ.get("LOCAL_IMPORT") == "1":
+    # Allow running this test script without installing onnxruntime package.
+    import sys
+
+    sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "..", "python", "tools"))
+    from quantization import QDQQuantizer, QuantFormat, QuantType, quantize_static
+    from quantization.calibrate import TensorData
+else:
+    from onnxruntime.quantization import QDQQuantizer, QuantFormat, QuantType, quantize_static
+    from onnxruntime.quantization.calibrate import TensorData
 
 
 class TestQDQFormat(unittest.TestCase):
