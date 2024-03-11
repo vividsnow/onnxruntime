@@ -125,18 +125,21 @@ class TensorQuantOverridesHelper(MutableMapping):
             self.overrides[tensor_name] = [{"quant_type": producer_type}]
 
         overrides = self.overrides[tensor_name][0]
+        if producer_type != overrides["quant_type"]:
+            raise ValueError(f"Desired producer quant_type for {tensor_name} doesn't match existing type.")
 
-        if "convert" not in overrides:
-            overrides["convert"] = {"quant_type": consumer_type}
+        if consumer_names:
+            if "convert" not in overrides:
+                overrides["convert"] = {"quant_type": consumer_type}
 
-        convert_dict = overrides["convert"]
-        if consumer_type != convert_dict["quant_type"]:
-            raise ValueError(f"Desired consumer quant_type for {tensor_name} doesn't match existing type.")
+            convert_dict = overrides["convert"]
+            if consumer_type != convert_dict["quant_type"]:
+                raise ValueError(f"Desired consumer quant_type for {tensor_name} doesn't match existing type.")
 
-        if "recv_nodes" not in convert_dict:
-            convert_dict["recv_nodes"] = set()
+            if "recv_nodes" not in convert_dict:
+                convert_dict["recv_nodes"] = set()
 
-        convert_dict["recv_nodes"].update(consumer_names)
+            convert_dict["recv_nodes"].update(consumer_names)
 
     def check_nodes_are_not_convert_consumers(self, tensor_name: str, node_names: set[str]):
         if tensor_name not in self.overrides or not self.overrides[tensor_name]:
@@ -360,7 +363,7 @@ class MixedPrecisionTensorQuantOverridesFixer:
         # Use type requests to "fix" tensor quantization overrides by adding
         # quantization type conversions where necessary.
         for tensor_name, type_req in type_requests.items():
-            all_consumers = set([node.name for node in self.consumers[tensor_name]])
+            all_consumers = set([node.name for node in self.consumers.get(tensor_name, [])])
             has_producer_req = type_req.producer_type is not None
             has_consumer_req = bool(type_req.consumers)
 
@@ -430,7 +433,7 @@ class MixedPrecisionTensorQuantOverridesFixer:
                     self._build_desired_types_for_node(type_requests, quant_type, producer_node)
 
                 # Find all consumer nodes of `tensor_name` and update their inputs/outputs to the new type.
-                for consumer_node in self.consumers[tensor_name]:
+                for consumer_node in self.consumers.get(tensor_name, []):
                     self._build_desired_types_for_node(type_requests, quant_type, consumer_node)
 
         return type_requests
