@@ -166,7 +166,7 @@ class QDQQuantizer(BaseQuantizer):
         # if the activation or weight types are 16-bit integers.
         # TODO: Remove this override (and use only the 'UseQDQContribOps' option) if/when ONNX adds 16-bit support.
         int16_types = (TensorProto.UINT16, TensorProto.INT16)
-        overrides_have_int16 = any(t in int16_types for t in self.tensor_quant_override_types)
+        overrides_have_int16 = any(t.tensor_type in int16_types for t in self.tensor_quant_override_qtypes)
         if not self.qdq_op_domain and (
             self.activation_qType in int16_types or self.weight_qType in int16_types or overrides_have_int16
         ):
@@ -950,7 +950,7 @@ class QDQQuantizer(BaseQuantizer):
             if not isinstance(td, TensorData):
                 raise TypeError(f"Unexpected type {type(td)} for {tensor_name!r}.")
 
-            quant_overrides = self.get_per_tensor_quant_overrides(tensor_name)
+            quant_overrides = self.tensor_quant_overrides.get_per_tensor_overrides(tensor_name)
             original = self.calculate_quantization_params(td, quant_overrides)
             converted = None
             converted_recv_nodes = None

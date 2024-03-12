@@ -27,7 +27,7 @@ class TensorQuantOverridesHelper(MutableMapping):
         self.default_weight_qtype = default_weight_qtype
         self.quant_types = None
 
-    def get_per_tensor_quant_overrides(self, tensor_name: str) -> dict[str, Any]:
+    def get_per_tensor_overrides(self, tensor_name: str) -> dict[str, Any]:
         overrides_list = self.overrides.get(tensor_name, [{}])
         num_overrides = len(overrides_list)
         if num_overrides > 1:
@@ -38,7 +38,7 @@ class TensorQuantOverridesHelper(MutableMapping):
 
         return overrides_list[0] if num_overrides > 0 else {}
 
-    def get_per_channel_quant_overrides(
+    def get_per_channel_overrides(
         self,
         tensor_name: str,
         num_channels: int,
