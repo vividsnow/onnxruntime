@@ -953,24 +953,9 @@ class ONNXQuantizer(BaseQuantizer):
 
     def calculate_quantization_params(self):
         if self.tensors_range is None:
-            return
+            return None
 
-        # adjust tensor_ranges for input of Clip and Relu node
-        for node in self.model.nodes():
-            if node.op_type not in ["Clip", "Relu"]:
-                continue
-            if self.is_activation_symmetric:
-                continue
-            if not self.should_quantize_node(node):
-                continue
-            if len(self.model.input_name_to_nodes()[node.input[0]]) != 1:
-                continue
-            if node.input[0] not in self.tensors_range or node.output[0] not in self.tensors_range:
-                continue
-            td = self.tensors_range[node.output[0]]
-            if not isinstance(td, TensorData):
-                raise TypeError(f"Unexpected type {type(td)} for {node.output[0]!r}.")
-            self.tensors_range[node.input[0]] = td
+        self.adjust_tensor_ranges(softmax_0_to_1=False)
 
         quantization_params = {}
         for tensor_name in self.tensors_range:
