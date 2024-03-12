@@ -343,11 +343,12 @@ class QDQQuantizer(BaseQuantizer):
     def try_replacing_upstream_output(self, upstream_output_name, output_name):
         if (
             output_name in self.quantization_params
+            and self.quantization_params[output_name].converted is None
+            and self.quantization_params[upstream_output_name].converted is None
             and len(self.model.input_name_to_nodes()[upstream_output_name]) == 1
             and not self.model.is_graph_output(upstream_output_name)
             and not self.model.is_graph_input(upstream_output_name)
         ):
-            # TODO: Check same qtype ??
             self.model.replace_output_of_all_nodes(upstream_output_name, output_name)
             if upstream_output_name in self.tensors_to_quantize:
                 del self.tensors_to_quantize[upstream_output_name]
