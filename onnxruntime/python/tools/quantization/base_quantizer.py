@@ -118,13 +118,11 @@ class BaseQuantizer:
         self.opset_version = self.check_opset_version()
 
         # Get tensor-level quantization overrides and ensure they are valid.
-        self.tensor_quant_overrides = TensorQuantOverridesHelper(
-            self.extra_options.get("TensorQuantOverrides", {}), activation_qType, weight_qType
-        )
+        self.tensor_quant_overrides = TensorQuantOverridesHelper(self.extra_options.get("TensorQuantOverrides", {}))
 
         initializer_names = {initzer.name for initzer in self.model.initializer()}
         overrides_valid, overrides_err = self.tensor_quant_overrides.is_valid(
-            initializer_names, self.value_infos.keys()
+            initializer_names, self.value_infos.keys(), activation_qType
         )
         if not overrides_valid:
             raise ValueError(overrides_err)

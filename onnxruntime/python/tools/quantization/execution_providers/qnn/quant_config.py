@@ -43,12 +43,17 @@ def get_qnn_qdq_config(
     calibrate_method=CalibrationMethod.MinMax,
     activation_type=QuantType.QUInt8,
     weight_type=QuantType.QUInt8,
+    per_channel=False,
     init_overrides=None,
     add_qtype_converts=True,
-    per_channel=False,
+    activation_symmetric=False,
+    weight_symmetric=None,
 ):
     if per_channel:
         raise ValueError("QNN EP does not yet support per-channel quantization.")
+
+    if weight_symmetric is None:
+        weight_symmetric = weight_type in {QuantType.QInt8, QuantType.QInt16}
 
     model = onnx.load_model(model_input, load_external_data=False)
     model = onnx.shape_inference.infer_shapes(model)
@@ -68,25 +73,23 @@ def get_qnn_qdq_config(
     value_infos.update({ot.name: ot for ot in model.graph.output})
     value_infos.update({it.name: it for it in model.graph.input})
 
-    overrides_helper = TensorQuantOverridesHelper(
-        copy.deepcopy(init_overrides) if init_overrides else {}, activation_type, weight_type
-    )
+    overrides_helper = TensorQuantOverridesHelper(copy.deepcopy(init_overrides) if init_overrides else {})
 
     if not overrides_helper.empty() and add_qtype_converts:
         overrides_fixer = MixedPrecisionTensorQuantOverridesFixer.create_from_model(overrides_helper, model)
-        overrides_fixer.apply()
+        overrides_fixer.apply(activation_type, activation_symmetric)
 
     # Setup quantization overrides for specific operator types
     for node in model.graph.node:
         if node.op_type == "MatMul" and weight_type in Q8_TYPES:
-            weight_symmetric = weight_type == QuantType.QInt8
-
             input_16bit_act = None
             input_wgt = None
 
             for input_name in node.input:
                 if input_name not in name_to_initializer:
-                    qtype = overrides_helper.get_node_input_qtype(input_name, node.name)
+                    qtype = overrides_helper.get_node_input_qtype_info(
+                        input_name, node.name, activation_type
+                    ).quant_type
                     if qtype in Q16_TYPES:
                         input_16bit_act = input_name
                 else:
@@ -103,12 +106,12 @@ def get_qnn_qdq_config(
                 if not did_update:
                     warn_unable_to_override(node, "quant_type/symmetric", input_wgt, "input weight")
         elif node.op_type == "LayerNormalization" and weight_type in Q8_TYPES:
-            weight_symmetric = weight_type == QuantType.QInt8
-
             has_q16_activation = False
             for input_name in node.input:
                 if input_name not in name_to_initializer:
-                    qtype = overrides_helper.get_node_input_qtype(input_name, node.name)
+                    qtype = overrides_helper.get_node_input_qtype_info(
+                        input_name, node.name, activation_type
+                    ).quant_type
                     if qtype in Q16_TYPES:
                         has_q16_activation = True
                         break
@@ -128,7 +131,7 @@ def get_qnn_qdq_config(
                             warn_unable_to_override(node, "quant_type/symmetric", input_name, "input weight")
 
         elif node.op_type == "Sigmoid":
-            output_type = overrides_helper.get_node_output_qtype(node.output[0])
+            output_type = overrides_helper.get_node_output_qtype_info(node.output[0], activation_type).quant_type
 
             if output_type == QuantType.QUInt16:
                 did_update = overrides_helper.update_tensor_overrides(
@@ -155,7 +158,7 @@ def get_qnn_qdq_config(
                 if not did_update:
                     warn_unable_to_override(node, "quant_type/scale/zero_point", node.output[0], "output")
         elif node.op_type == "Tanh":
-            output_type = overrides_helper.get_node_output_qtype(node.output[0])
+            output_type = overrides_helper.get_node_output_qtype_info(node.output[0]).quant_type
 
             if output_type == QuantType.QUInt16:
                 did_update = overrides_helper.update_tensor_overrides(
@@ -182,7 +185,7 @@ def get_qnn_qdq_config(
                 if not did_update:
                     warn_unable_to_override(node, "quant_type/scale/zero_point", node.output[0], "output")
 
-    valid, err = overrides_helper.is_valid(set(name_to_initializer), set(value_infos))
+    valid, err = overrides_helper.is_valid(set(name_to_initializer), set(value_infos), activation_type)
 
     if not valid:
         pprint_overrides = overrides_helper.pprint_str(indent=4)
@@ -193,6 +196,8 @@ def get_qnn_qdq_config(
         "MinimumRealRange": 0.0001,
         "DedicatedQDQPair": False,  # Let ORT optimizer duplicate DQ nodes
         "TensorQuantOverrides": overrides_helper.get_dict(),
+        "ActivationSymmetric": activation_symmetric,
+        "WeightSymmetric": weight_symmetric,
     }
 
     # TODO: Remove this extra option once ORT uses an ONNX version that supports 16-bit Q/DQ ops.

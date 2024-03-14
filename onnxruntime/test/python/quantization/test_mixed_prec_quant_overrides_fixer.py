@@ -69,11 +69,10 @@ class TestMixedPrecisionQuantOverridesFixer(unittest.TestCase):
         onnx.save_model(model, "model.onnx")
 
         default_act_qtype = QuantType.QUInt8
-        default_wgt_qtype = QuantType.QUInt8
         raw_overrides = {"op4_out": [{"quant_type": QuantType.QUInt16}]}
-        overrides = TensorQuantOverridesHelper(raw_overrides, default_act_qtype, default_wgt_qtype)
+        overrides = TensorQuantOverridesHelper(raw_overrides)
         fixer = MixedPrecisionTensorQuantOverridesFixer.create_from_model(overrides, model)
-        fixer.apply()
+        fixer.apply(default_act_qtype, default_activation_symmetric=False)
 
         expected = {
             "op2_out": [
@@ -87,22 +86,56 @@ class TestMixedPrecisionQuantOverridesFixer(unittest.TestCase):
                 {"quant_type": QuantType.QUInt16, "convert": {"quant_type": QuantType.QUInt8, "recv_nodes": {"op6"}}}
             ],
         }
-        self.assertEqual(overrides.get_dict(), expected)
+        self.assertDictEqual(overrides.get_dict(), expected)
 
-    def test_fixer_2(self):
+    def test_fixer_with_symmetric(self):
+        shape = (1, 2, 3)
+        model = self.build_test_model_1(shape)
+        onnx.save_model(model, "model.onnx")
+
+        default_act_qtype = QuantType.QInt8
+        raw_overrides = {"op4_out": [{"quant_type": QuantType.QInt16, "symmetric": True}]}
+        overrides = TensorQuantOverridesHelper(raw_overrides)
+        fixer = MixedPrecisionTensorQuantOverridesFixer.create_from_model(overrides, model)
+        fixer.apply(default_act_qtype, default_activation_symmetric=False)
+
+        expected = {
+            "op2_out": [
+                {
+                    "quant_type": QuantType.QInt8,
+                    "convert": {"quant_type": QuantType.QInt16, "symmetric": True, "recv_nodes": {"op4"}},
+                }
+            ],
+            "op3_out": [
+                {
+                    "quant_type": QuantType.QInt8,
+                    "convert": {"quant_type": QuantType.QInt16, "symmetric": True, "recv_nodes": {"op5"}},
+                }
+            ],
+            "op4_out": [{"quant_type": QuantType.QInt16, "symmetric": True}],
+            "op5_out": [
+                {
+                    "quant_type": QuantType.QInt16,
+                    "symmetric": True,
+                    "convert": {"quant_type": QuantType.QInt8, "recv_nodes": {"op6"}},
+                }
+            ],
+        }
+        self.assertDictEqual(overrides.get_dict(), expected)
+
+    def test_fixer_upgrade_output(self):
         shape = (1, 2, 3)
         model = self.build_test_model_1(shape)
         onnx.save_model(model, "model.onnx")
 
         default_act_qtype = QuantType.QUInt8
-        default_wgt_qtype = QuantType.QUInt8
         raw_overrides = {
             "op4_out": [{"quant_type": QuantType.QUInt16}],
             "output_0": [{"quant_type": QuantType.QUInt16}],
         }
-        overrides = TensorQuantOverridesHelper(raw_overrides, default_act_qtype, default_wgt_qtype)
+        overrides = TensorQuantOverridesHelper(raw_overrides)
         fixer = MixedPrecisionTensorQuantOverridesFixer.create_from_model(overrides, model)
-        fixer.apply()
+        fixer.apply(default_act_qtype, default_activation_symmetric=False)
 
         expected = {
             "op2_out": [
@@ -115,19 +148,18 @@ class TestMixedPrecisionQuantOverridesFixer(unittest.TestCase):
             "op5_out": [{"quant_type": QuantType.QUInt16}],
             "output_0": [{"quant_type": QuantType.QUInt16}],
         }
-        self.assertEqual(overrides.get_dict(), expected)
+        self.assertDictEqual(overrides.get_dict(), expected)
 
-    def test_fixer_3(self):
+    def test_fixer_upgrade_input(self):
         shape = (1, 2, 3)
         model = self.build_test_model_1(shape)
         onnx.save_model(model, "model.onnx")
 
         default_act_qtype = QuantType.QUInt8
-        default_wgt_qtype = QuantType.QUInt8
         raw_overrides = {"op4_out": [{"quant_type": QuantType.QUInt16}], "input_0": [{"quant_type": QuantType.QUInt16}]}
-        overrides = TensorQuantOverridesHelper(raw_overrides, default_act_qtype, default_wgt_qtype)
+        overrides = TensorQuantOverridesHelper(raw_overrides)
         fixer = MixedPrecisionTensorQuantOverridesFixer.create_from_model(overrides, model)
-        fixer.apply()
+        fixer.apply(default_act_qtype, default_activation_symmetric=False)
 
         expected = {
             "input_0": [{"quant_type": QuantType.QUInt16}],
@@ -145,4 +177,4 @@ class TestMixedPrecisionQuantOverridesFixer(unittest.TestCase):
                 {"quant_type": QuantType.QUInt16, "convert": {"quant_type": QuantType.QUInt8, "recv_nodes": {"op6"}}}
             ],
         }
-        self.assertEqual(overrides.get_dict(), expected)
+        self.assertDictEqual(overrides.get_dict(), expected)

@@ -15,16 +15,45 @@ import onnx
 from .quant_utils import QuantType
 
 
+@dataclass
+class QuantTypeInfo:
+    quant_type: QuantType
+    symmetric: bool | None = None
+    reduce_range: bool | None = None
+
+    def __eq__(self, other: object):
+        if isinstance(other, QuantTypeInfo):
+            return (
+                self.quant_type == other.quant_type
+                and (self.symmetric is None or other.symmetric is None or self.symmetric == other.symmetric)
+                and (self.reduce_range is None or other.reduce_range is None or self.reduce_range == other.reduce_range)
+            )
+        return NotImplemented
+
+    @staticmethod
+    def load_from_dict(
+        raw_dict: dict[str, Any],
+        default_activation_qtype: QuantType | None = None,
+        default_activation_symmetric: bool | None = None,
+        default_activation_reduce_range: bool | None = None,
+    ) -> QuantTypeInfo:
+        return QuantTypeInfo(
+            raw_dict.get("quant_type", default_activation_qtype),
+            raw_dict.get("symmetric", default_activation_symmetric),
+            raw_dict.get("reduce_range", default_activation_reduce_range),
+        )
+
+    def save_to_dict(self, raw_dict: dict[str, Any]):
+        raw_dict["quant_type"] = self.quant_type
+        if self.symmetric is not None:
+            raw_dict["symmetric"] = self.symmetric
+        if self.reduce_range is not None:
+            raw_dict["reduce_range"] = self.reduce_range
+
+
 class TensorQuantOverridesHelper(MutableMapping):
-    def __init__(
-        self,
-        raw_overrides: dict[str, list[dict[str, Any]]],
-        default_activation_qtype: QuantType,
-        default_weight_qtype: QuantType,
-    ):
+    def __init__(self, raw_overrides: dict[str, list[dict[str, Any]]]):
         self.overrides = raw_overrides
-        self.default_activation_qtype = default_activation_qtype
-        self.default_weight_qtype = default_weight_qtype
         self.quant_types = None
 
     def get_per_tensor_overrides(self, tensor_name: str) -> dict[str, Any]:
@@ -53,35 +82,57 @@ class TensorQuantOverridesHelper(MutableMapping):
 
         return overrides_list
 
-    def get_node_output_qtype(self, output_name: str):
+    def get_node_output_qtype_info(
+        self,
+        output_name: str,
+        default_qtype: QuantType | None,
+        default_symmetric: bool | None = None,
+    ) -> QuantTypeInfo:
         if output_name not in self.overrides:
-            return self.default_activation_qtype
+            return QuantTypeInfo(default_qtype, default_symmetric)
 
         # Get the first overrides dict in the list. This works for both per-tensor and per-channel
         # quantization because all channels must use the same quant type.
         tensor_overrides = self.overrides[output_name][0]
 
-        return tensor_overrides.get("quant_type", self.default_activation_qtype)
+        return QuantTypeInfo(
+            tensor_overrides.get("quant_type", default_qtype),
+            tensor_overrides.get("symmetric", default_symmetric),
+        )
 
-    def get_node_input_qtype(self, input_name: str, node_name: str):
+    def get_node_input_qtype_info(
+        self,
+        input_name: str,
+        node_name: str,
+        default_qtype: QuantType | None,
+        default_symmetric: bool | None = None,
+        default_reduce_range: bool | None = None,
+    ) -> QuantTypeInfo:
         if input_name not in self.overrides or not self.overrides[input_name]:
-            return self.default_activation_qtype
+            return QuantTypeInfo(default_qtype, default_symmetric, default_reduce_range)
 
         # Get the first overrides dict in the list. This works for both per-tensor and per-channel
         # quantization because all channels must use the same quant type.
         tensor_overrides = self.overrides[input_name][0]
-        producer_type = tensor_overrides.get("quant_type", self.default_activation_qtype)
+        producer_type = tensor_overrides.get("quant_type", default_qtype)
 
         if "convert" not in tensor_overrides:
-            return producer_type
+            return QuantTypeInfo(producer_type, default_symmetric, default_reduce_range)
 
+        # This tensor is converted. Check if the node gets the original qtype or the converted qtype.
         convert_dict = tensor_overrides["convert"]
+        qtype_info = QuantTypeInfo(
+            producer_type,
+            convert_dict.get("symmetric", default_symmetric),
+            convert_dict.get("reduce_range", default_reduce_range),
+        )
 
-        if "recv_nodes" not in convert_dict:
-            return convert_dict["quant_type"]  # All consumers converted to the quant_type
+        # Check if all nodes receive the coverted type (i.e., recv_nodes is None) or this node
+        # is in the list of consumers (recv_nodes).
+        if ("recv_nodes" not in convert_dict) or (node_name in convert_dict["recv_nodes"]):
+            qtype_info.quant_type = convert_dict["quant_type"]
 
-        # Only specific consumers get the converted quant_type
-        return convert_dict["quant_type"] if node_name in tensor_overrides["convert"]["recv_nodes"] else producer_type
+        return qtype_info
 
     def update_tensor_overrides(
         self,
@@ -118,45 +169,6 @@ class TensorQuantOverridesHelper(MutableMapping):
 
         return do_update
 
-    def update_converted_tensor(
-        self, tensor_name: str, producer_type: QuantType, consumer_type: QuantType, consumer_names: set[str]
-    ):
-        if tensor_name not in self.overrides or not self.overrides[tensor_name]:
-            self.overrides[tensor_name] = [{"quant_type": producer_type}]
-
-        overrides = self.overrides[tensor_name][0]
-        if producer_type != overrides["quant_type"]:
-            raise ValueError(f"Desired producer quant_type for {tensor_name} doesn't match existing type.")
-
-        if consumer_names:
-            if "convert" not in overrides:
-                overrides["convert"] = {"quant_type": consumer_type}
-
-            convert_dict = overrides["convert"]
-            if consumer_type != convert_dict["quant_type"]:
-                raise ValueError(f"Desired consumer quant_type for {tensor_name} doesn't match existing type.")
-
-            if "recv_nodes" not in convert_dict:
-                convert_dict["recv_nodes"] = set()
-
-            convert_dict["recv_nodes"].update(consumer_names)
-
-    def check_nodes_are_not_convert_consumers(self, tensor_name: str, node_names: set[str]):
-        if tensor_name not in self.overrides or not self.overrides[tensor_name]:
-            return True
-
-        overrides = self.overrides[tensor_name][0]
-
-        if "convert" not in overrides:
-            return True
-
-        convert_dict = overrides["convert"]
-
-        if "recv_nodes" not in convert_dict:
-            return False
-
-        return not convert_dict["recv_nodes"].intersection(node_names)
-
     def get_quant_types(self) -> set[QuantType]:
         if self.quant_types is not None:
             return self.quant_types
@@ -174,7 +186,12 @@ class TensorQuantOverridesHelper(MutableMapping):
 
         return self.quant_types
 
-    def is_valid(self, initializer_names: set[str], activation_names: set[str]) -> tuple[bool, str | None]:
+    def is_valid(
+        self,
+        initializer_names: set[str],
+        activation_names: set[str],
+        default_activation_qtype,
+    ) -> tuple[bool, str | None]:
         self.quant_types = set()
 
         # Validate that compatible/valid overrides are provided.
@@ -233,6 +250,12 @@ class TensorQuantOverridesHelper(MutableMapping):
                                     f"Tensor override option '{key}' is invalid with 'scale' and 'zero_point'",
                                 )
 
+                    if "reduce_range" in quant_overrides and not is_initializer:
+                        return (
+                            False,
+                            f"Option 'reduce_range' is only supported for initializers, not for activation {tensor_name}",
+                        )
+
                     if "convert" in quant_overrides:
                         if index > 0:
                             return (
@@ -246,8 +269,14 @@ class TensorQuantOverridesHelper(MutableMapping):
                         if "quant_type" not in quant_overrides["convert"]:
                             return False, f"'convert' options (tensor '{tensor_name}') must specify a 'quant_type'"
 
+                        if "reduce_range" in quant_overrides["convert"]:
+                            return (
+                                False,
+                                f"Option 'reduce_range' is only supported for initializers, not for activation {tensor_name}",
+                            )
+
                         convert_quant_type = quant_overrides["convert"]["quant_type"]
-                        original_quant_type = quant_type if quant_type is not None else self.default_activation_qtype
+                        original_quant_type = quant_type if quant_type is not None else default_activation_qtype
                         if convert_quant_type == original_quant_type:
                             return (
                                 False,
@@ -312,8 +341,8 @@ class TensorQuantOverridesHelper(MutableMapping):
 
 @dataclass
 class TensorTypeRequest:
-    producer_type: QuantType | None
-    consumers: tuple[QuantType, set[str]] | None
+    producer: QuantTypeInfo | None
+    consumers: tuple[QuantTypeInfo, set[str]] | None
 
 
 class MixedPrecisionTensorQuantOverridesFixer:
@@ -356,41 +385,48 @@ class MixedPrecisionTensorQuantOverridesFixer:
 
         return MixedPrecisionTensorQuantOverridesFixer(overrides, producers, consumers, value_infos, initializers)
 
-    def apply(self):
-        type_requests = self.get_desired_tensor_types()
-        default_activation_qtype = self.overrides.default_activation_qtype
+    def apply(
+        self,
+        default_activation_qtype: QuantType,
+        default_activation_symmetric: bool,
+    ):
+        type_requests = self.get_desired_tensor_types(default_activation_qtype, default_activation_symmetric)
 
         # Use type requests to "fix" tensor quantization overrides by adding
         # quantization type conversions where necessary.
         for tensor_name, type_req in type_requests.items():
             all_consumers = set([node.name for node in self.consumers.get(tensor_name, [])])
-            has_producer_req = type_req.producer_type is not None
+            has_producer_req = type_req.producer is not None
             has_consumer_req = bool(type_req.consumers)
 
             # Only producer type: Add conversion back to default activation type
             if has_producer_req and not has_consumer_req:
-                self.overrides.update_converted_tensor(
-                    tensor_name, type_req.producer_type, default_activation_qtype, all_consumers
+                self._update_converted_tensor(
+                    tensor_name, type_req.producer, QuantTypeInfo(default_activation_qtype), all_consumers
                 )
             # Only consumers
             elif not has_producer_req and has_consumer_req:
-                prod_type = self.overrides.get_node_output_qtype(tensor_name)
-                consumer_type = type_req.consumers[0]
+                prod_type_info = self.overrides.get_node_output_qtype_info(tensor_name, default_activation_qtype)
+                consumer_type_info = type_req.consumers[0]
 
-                if prod_type != consumer_type:
-                    self.overrides.update_converted_tensor(tensor_name, prod_type, consumer_type, type_req.consumers[1])
+                if prod_type_info != consumer_type_info:
+                    self._update_converted_tensor(
+                        tensor_name, prod_type_info, consumer_type_info, type_req.consumers[1]
+                    )
                 else:
-                    if not self.overrides.check_nodes_are_not_convert_consumers(tensor_name, type_req.consumers[1]):
+                    if not self._check_nodes_are_not_convert_consumers(tensor_name, type_req.consumers[1]):
                         raise ValueError(
                             f"Tensor override for '{tensor_name}' converts the type for consumers that need the original type."
                         )
             # Both producer and consumers
             elif has_producer_req and has_consumer_req:
-                prod_type = type_req.producer_type
-                consumer_type = type_req.consumers[0]
+                prod_type_info = type_req.producer
+                consumer_type_info = type_req.consumers[0]
 
-                if prod_type != consumer_type:
-                    self.overrides.update_converted_tensor(tensor_name, prod_type, consumer_type, type_req.consumers[1])
+                if prod_type_info != consumer_type_info:
+                    self._update_converted_tensor(
+                        tensor_name, prod_type_info, consumer_type_info, type_req.consumers[1]
+                    )
                 else:
                     consumers_for_original_type = all_consumers.difference(type_req.consumers[1])
 
@@ -398,20 +434,28 @@ class MixedPrecisionTensorQuantOverridesFixer:
                         # All consumers want the overridden type, so no need for convert nodes!
                         # Just add the override to the new new if not already present.
                         if tensor_name not in self.overrides:
-                            self.overrides[tensor_name] = [{"quant_type": prod_type}]
+                            self.overrides[tensor_name] = [{}]
+                            prod_type_info.save_to_dict(self.overrides[tensor_name][0])
 
                         assert "convert" not in self.overrides[tensor_name][0]
                     else:
                         # Some consumers don't want the overridden type.
-                        self.overrides.update_converted_tensor(
-                            tensor_name, prod_type, default_activation_qtype, consumers_for_original_type
+                        self._update_converted_tensor(
+                            tensor_name,
+                            prod_type_info,
+                            QuantTypeInfo(default_activation_qtype),
+                            consumers_for_original_type,
                         )
             else:
                 raise ValueError(f"TypeRequest for tensor {tensor_name} has no producer or consumers.")
 
-    def get_desired_tensor_types(self):
+    def get_desired_tensor_types(
+        self,
+        default_activation_qtype: QuantType,
+        default_activation_symmetric: bool,
+    ) -> dict[str, TensorTypeRequest]:
         type_requests = {}
-        default_activation_qtype = self.overrides.default_activation_qtype
+        default_activation_type_info = QuantTypeInfo(default_activation_qtype, default_activation_symmetric)
 
         # Scan tensor overrides for type conversion requests.
         for tensor_name, override_list in self.overrides.items():
@@ -424,24 +468,24 @@ class MixedPrecisionTensorQuantOverridesFixer:
             if not override_list or len(override_list) > 1:
                 continue  # Skip per-channel stuff
 
-            override = override_list[0]
-            quant_type = override.get("quant_type", default_activation_qtype)
+            override_dict = override_list[0]
+            quant_type_info = QuantTypeInfo.load_from_dict(override_dict, default_activation_type_info.quant_type)
             producer_node = self.producers.get(tensor_name)  # None if this is a model input
 
-            if quant_type != default_activation_qtype and "convert" not in override:
+            if quant_type_info != default_activation_type_info and "convert" not in override_dict:
                 if producer_node is not None:
-                    self._build_desired_types_for_node(type_requests, quant_type, producer_node)
+                    self._add_type_requests_for_node(type_requests, quant_type_info, producer_node)
 
                 # Find all consumer nodes of `tensor_name` and update their inputs/outputs to the new type.
                 for consumer_node in self.consumers.get(tensor_name, []):
-                    self._build_desired_types_for_node(type_requests, quant_type, consumer_node)
+                    self._add_type_requests_for_node(type_requests, quant_type_info, consumer_node)
 
         return type_requests
 
-    def _build_desired_types_for_node(
+    def _add_type_requests_for_node(
         self,
         type_requests: dict[str, TensorTypeRequest],
-        quant_type: QuantType,
+        quant_type_info: QuantTypeInfo,
         node: onnx.NodeProto,
     ):
         # Add output side
@@ -450,15 +494,15 @@ class MixedPrecisionTensorQuantOverridesFixer:
                 continue
 
             if output_name not in type_requests:
-                type_requests[output_name] = TensorTypeRequest(quant_type, None)
+                type_requests[output_name] = TensorTypeRequest(quant_type_info, None)
             else:
                 if (
-                    type_requests[output_name].producer_type is not None
-                    and type_requests[output_name].producer_type != quant_type
+                    type_requests[output_name].producer is not None
+                    and type_requests[output_name].producer != quant_type_info
                 ):
                     raise ValueError(f"Tensor {output_name} has multiple types.")
 
-                type_requests[output_name].producer_type = quant_type
+                type_requests[output_name].producer = quant_type_info
 
         # Add the consumer side
         for input_name in node.input:
@@ -467,9 +511,9 @@ class MixedPrecisionTensorQuantOverridesFixer:
                     type_requests[input_name] = TensorTypeRequest(None, None)
 
                 if type_requests[input_name].consumers is None:
-                    type_requests[input_name].consumers = (quant_type, set())
+                    type_requests[input_name].consumers = (quant_type_info, set())
 
-                if type_requests[input_name].consumers[0] != quant_type:
+                if type_requests[input_name].consumers[0] != quant_type_info:
                     raise ValueError(f"Tensor {input_name} has consumers requesting different types.")
 
                 if not node.name:
@@ -478,6 +522,51 @@ class MixedPrecisionTensorQuantOverridesFixer:
                     )
 
                 type_requests[input_name].consumers[1].add(node.name)
+
+    def _update_converted_tensor(
+        self,
+        tensor_name: str,
+        producer_type_info: QuantTypeInfo,
+        consumer_type_info: QuantTypeInfo,
+        consumer_names: set[str],
+    ):
+        if tensor_name not in self.overrides or not self.overrides[tensor_name]:
+            self.overrides[tensor_name] = [{}]
+            producer_type_info.save_to_dict(self.overrides[tensor_name][0])
+
+        overrides = self.overrides[tensor_name][0]
+        if producer_type_info != QuantTypeInfo.load_from_dict(overrides):
+            raise ValueError(f"Desired producer quant_type for {tensor_name} doesn't match existing type.")
+
+        if consumer_names:
+            if "convert" not in overrides:
+                overrides["convert"] = {}
+                consumer_type_info.save_to_dict(overrides["convert"])
+
+            convert_dict = overrides["convert"]
+            if consumer_type_info != QuantTypeInfo.load_from_dict(convert_dict):
+                raise ValueError(f"Desired consumer quant_type for {tensor_name} doesn't match existing type.")
+
+            if "recv_nodes" not in convert_dict:
+                convert_dict["recv_nodes"] = set()
+
+            convert_dict["recv_nodes"].update(consumer_names)
+
+    def _check_nodes_are_not_convert_consumers(self, tensor_name: str, node_names: set[str]):
+        if tensor_name not in self.overrides or not self.overrides[tensor_name]:
+            return True
+
+        overrides = self.overrides[tensor_name][0]
+
+        if "convert" not in overrides:
+            return True
+
+        convert_dict = overrides["convert"]
+
+        if "recv_nodes" not in convert_dict:
+            return False
+
+        return not convert_dict["recv_nodes"].intersection(node_names)
 
     # TODO: This should either be a shared util or should be a closure that is passed in
     # to the constructor.
