@@ -243,8 +243,12 @@ class QDQQuantizer(BaseQuantizer):
 
     def __quantize_tensor(self, tensor_name, quant_sharing_provider=None, tensor_type=QDQQuantTensorType.ACTIVATION):
         """
-        Quantize tensors. If quant_sharing_provider is not None, tensor with name tensor_name will be quantized with same
-        quantization parameters as the node input specified in quant_sharing_provider.
+        Adds a tensor to the list (actually a dict) of tensors to quantize. Called indirectly by op quantizers that
+        want to quantize a tensor (i.e., "mark" a tensor for quantization).
+
+        If quant_sharing_provider is not None, tensor with name tensor_name will be quantized with the same
+        quantization parameters as the node input specified in quant_sharing_provider. Ex: A Tranpose node's output
+        will typically use the same quantization parameter initializers used at the Transpose node's input.
 
         Args:
             tensor_name: name of the tensor to quantize
@@ -266,28 +270,40 @@ class QDQQuantizer(BaseQuantizer):
                 data_type = self._get_tensor_type(tensor_name)
                 self.tensors_to_quantize[tensor_name] = QDQTensorQuantInfo(tensor_type=tensor_type, data_type=data_type)
 
-    def quantize_activation_tensor(self, tensor_name):
+    def quantize_activation_tensor(self, tensor_name: str):
         """
-        Quantize Activation Tensor
+        Adds a tensor to the list of tensors to quantize. Called by op quantizers that
+        want to quantize a tensor (i.e., "mark" a tensor for quantization).
+
         Args:
             tensor_name: name of the tensor to quantize
         """
         return self.__quantize_tensor(tensor_name, None, QDQQuantTensorType.ACTIVATION)
 
-    def quantize_output_same_as_input(self, output_name, input_name, node_name):
+    def quantize_output_same_as_input(self, output_name: str, input_name: str, node_name: str):
         """
-        Quantize a node's output the same as one of its inputs.
+        Adds a tensor to the list of tensors to quantize. Called by op quantizers that
+        want to quantize an output tensor using the same quantization parameters as one of the node's inputs.
+
+        Ex: A Tranpose node's output will typically use the same quantization parameter initializers used at
+        the Transpose node's input.
+
+        Args:
+            output_name: name of the node output to quantize so that it uses the same quantization params as an input.
+            input_name: name of the node input from which the output tensor will get its quantization params.
+            node_name: name of the node that consumes `input_name`.
         """
         return self.__quantize_tensor(
             output_name, QDQQuantParamProvider(input_name, node_name), QDQQuantTensorType.ACTIVATION
         )
 
-    def quantize_weight_tensor(self, tensor_name):
+    def quantize_weight_tensor(self, tensor_name: str):
         """
-        Quantize Weight Tensor
-        Args:
-            tensor_name: name of the tensor to quantize
+        Adds a tensor to the list of weight tensors to quantize. Called by op quantizers that
+        want to quantize a weight (i.e., "mark" a weight for quantization).
 
+        Args:
+            tensor_name: name of the weight to quantize
         """
         return self.__quantize_tensor(tensor_name, None, QDQQuantTensorType.WEIGHT)
 
@@ -302,6 +318,18 @@ class QDQQuantizer(BaseQuantizer):
             logging.warning(f"only support per-channel quantization on weight. Tensor: {tensor_name} is not quantized.")
 
     def quantize_bias_tensor(self, node_name, bias_name, input_name, weight_name, beta=1.0):
+        """
+        Adds a bias tensor to the list of bias tensors to quantize. Called by op quantizers that
+        want to quantize a bias with bias_zero_point = 0 and bias_scale = input_scale * weight_scale * beta.
+        TODO: Explain the reasoning for using this formula.
+
+        Args:
+            node_name: name of the node that consumes the bias, input, and weight tensors.
+            bias_name: name of the bias tensor to quantize.
+            input_name: name of the input tensor whose scale is used to compute the bias's scale.
+            weight_name: name of the weight tensor whose scale is used to compute the bias's scale.
+            beta: Multiplier used to compute the bias's scale.
+        """
         # If the user provided quantization overrides for this tensor, treat it as a regular weight.
         if self.tensor_quant_overrides.get(bias_name):
             logging.info(
@@ -711,6 +739,9 @@ class QDQQuantizer(BaseQuantizer):
         )
 
     def _quantize_normal_tensors(self):
+        """
+        Adds Q/DQ ops to tensors (activations and weights) that have been marked for quantization by op quantizers.
+        """
         for tensor_name, tensor_info in self.tensors_to_quantize.copy().items():
             if tensor_name in self.quantized_value_map:
                 continue
@@ -755,7 +786,8 @@ class QDQQuantizer(BaseQuantizer):
 
     def _quantize_sharing_param_tensors(self):
         """
-        Quantizes tensors that want to use the quantization parameter initializers from an upstream tensor.
+        Adds Q/DQ ops to tensors that have been marked for quantization by op quantizers.
+        Only operates on tensors that want to use the quantization parameter initializers from an upstream tensor.
         For example, a Transpose node's output tensor will typically want to use the same quantization parameter
         initializers as the Transpose node's input.
         """
@@ -791,7 +823,7 @@ class QDQQuantizer(BaseQuantizer):
                     else:
                         # Conversion case: <producer> ---> Q_shared -+-> DQ_shared --> <consumers of original type>
                         #                                            |
-                        #                                            +-> DQ1' --> Q2 --> DQ2 --> <consumers of converted type>
+                        #                                            +-> DQ_shared' --> Q2 --> DQ2 --> <consumers of converted type>
                         self._add_qdq_ops_for_converted_activation(
                             tensor_name,
                             quantized_value.scale_name,
@@ -803,6 +835,9 @@ class QDQQuantizer(BaseQuantizer):
                         )
 
     def _quantize_bias_tensors(self):
+        """
+        Adds DQ ops (or Cast) for bias tensors that have been marked for quantization by op quantizers.
+        """
         for bias_name, bias_info in self.bias_to_quantize.items():
             if bias_name in self.quantized_value_map:
                 continue

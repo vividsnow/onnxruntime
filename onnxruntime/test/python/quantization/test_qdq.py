@@ -742,93 +742,6 @@ class TestQDQMixedPrecision(TestQDQFormat):
     def tearDownClass(cls):
         cls._tmp_model_dir.cleanup()
 
-    def build_test_model_1(self, shape):
-        input_0 = onnx.helper.make_tensor_value_info("input_0", onnx.TensorProto.FLOAT, shape)
-        input_1 = onnx.helper.make_tensor_value_info("input_1", onnx.TensorProto.FLOAT, shape)
-        output_0 = onnx.helper.make_tensor_value_info("output_0", onnx.TensorProto.FLOAT, shape)
-        output_1 = onnx.helper.make_tensor_value_info("output_1", onnx.TensorProto.FLOAT, shape)
-        output_2 = onnx.helper.make_tensor_value_info("output_2", onnx.TensorProto.FLOAT, shape)
-
-        op1_node = onnx.helper.make_node("Sigmoid", ["input_0"], ["op1_out"], name="op1")
-        op2_node = onnx.helper.make_node("Cos", ["input_1"], ["op2_out"], name="op2")
-        op3_node = onnx.helper.make_node("Sin", ["op1_out"], ["op3_out"], name="op3")
-        op4_node = onnx.helper.make_node("Tanh", ["op2_out"], ["op4_out"], name="op4")
-        op5_node = onnx.helper.make_node("Mul", ["op3_out", "op4_out"], ["op5_out"], name="op5")
-        op6_node = onnx.helper.make_node("Relu", ["op5_out"], ["output_0"], name="op6")
-        op7_node = onnx.helper.make_node("Cos", ["op2_out"], ["output_1"], name="op7")
-        op8_node = onnx.helper.make_node("Sigmoid", ["op2_out"], ["output_2"], name="op8")
-
-        graph = onnx.helper.make_graph(
-            [
-                op1_node,
-                op2_node,
-                op3_node,
-                op4_node,
-                op5_node,
-                op6_node,
-                op7_node,
-                op8_node,
-            ],
-            "mixed_prec_test",
-            [input_0, input_1],
-            [output_0, output_1, output_2],
-        )
-        opset_imports = [
-            onnx.helper.make_opsetid("", 18),
-        ]
-        model = onnx.helper.make_model(graph, opset_imports=opset_imports)
-        return onnx.shape_inference.infer_shapes(model)
-
-    def test_16bit_subgraph(self):
-        shape = (1, 2, 3)
-        f32_model_path = os.path.join(self._tmp_dir_path, "model.onnx")
-        qdq_model_path = os.path.join(self._tmp_dir_path, "model.qdq.onnx")
-        qdq_mixed_model_path = os.path.join(self._tmp_dir_path, "model.mixed.qdq.onnx")
-        f32_model = self.build_test_model_1(shape)
-        onnx.save_model(f32_model, f32_model_path)
-
-        data_reader = self.input_feeds(3, {"input_0": shape, "input_1": shape})
-
-        # Create pure 8-bit qdq model
-        quantize_static(
-            f32_model_path,
-            qdq_model_path,
-            data_reader,
-            quant_format=QuantFormat.QDQ,
-            activation_type=QuantType.QUInt8,
-            op_types_to_quantize=[node.op_type for node in f32_model.graph.node],
-        )
-
-        # Create mixed precision 8-bit/16-bit qdq model
-        mixed_prec_overrides = {
-            "op2_out": [
-                {"quant_type": QuantType.QUInt8, "convert": {"quant_type": QuantType.QUInt16, "recv_nodes": {"op4"}}}
-            ],
-            "op3_out": [
-                {"quant_type": QuantType.QUInt8, "convert": {"quant_type": QuantType.QUInt16, "recv_nodes": {"op5"}}}
-            ],
-            "op4_out": [{"quant_type": QuantType.QUInt16}],
-            "op5_out": [{"quant_type": QuantType.QUInt16}],
-            "output_0": [{"quant_type": QuantType.QUInt16}],
-        }
-        data_reader.rewind()
-        quantize_static(
-            f32_model_path,
-            qdq_mixed_model_path,
-            data_reader,
-            quant_format=QuantFormat.QDQ,
-            activation_type=QuantType.QUInt8,
-            op_types_to_quantize=[node.op_type for node in f32_model.graph.node],
-            extra_options={"TensorQuantOverrides": mixed_prec_overrides},
-        )
-
-        qop_nodes = {"Relu": 0, "QuantizeLinear": 11, "DequantizeLinear": 12}
-        check_op_type_count(self, qdq_mixed_model_path, **qop_nodes)
-        data_reader.rewind()
-        check_model_correctness(self, f32_model_path, qdq_mixed_model_path, data_reader.get_next())
-        data_reader.rewind()
-        check_model_correctness(self, f32_model_path, qdq_model_path, data_reader.get_next())
-
     def build_test_model_for_add_qdq_ops(self, num_consumers, is_graph_output, op0_transpose=False):
         """
         Builds a float32 model with a single producer node and a configurable number of consumer nodes.
@@ -1188,6 +1101,109 @@ class TestQDQMixedPrecision(TestQDQFormat):
                 self.assertEqual(output_3_zp_init.data_type, onnx.TensorProto.UINT16)
 
                 self.assertIn("op_0_out", graph_outputs)
+
+    def build_test_model_1(self, shape):
+        """
+        Returns the following float32 model.
+
+        input_0 --> op1 --> op3 --> op5 --> op6 --> output_0
+                                     ^
+                                     |
+        input_1 --> op2 -+-> op4 ----+
+                         |
+                         +-> op7 --> output_1
+                         |
+                         +-> op8 --> output_2
+        """
+        input_0 = onnx.helper.make_tensor_value_info("input_0", onnx.TensorProto.FLOAT, shape)
+        input_1 = onnx.helper.make_tensor_value_info("input_1", onnx.TensorProto.FLOAT, shape)
+        output_0 = onnx.helper.make_tensor_value_info("output_0", onnx.TensorProto.FLOAT, shape)
+        output_1 = onnx.helper.make_tensor_value_info("output_1", onnx.TensorProto.FLOAT, shape)
+        output_2 = onnx.helper.make_tensor_value_info("output_2", onnx.TensorProto.FLOAT, shape)
+
+        op1_node = onnx.helper.make_node("Sigmoid", ["input_0"], ["op1_out"], name="op1")
+        op2_node = onnx.helper.make_node("Cos", ["input_1"], ["op2_out"], name="op2")
+        op3_node = onnx.helper.make_node("Sin", ["op1_out"], ["op3_out"], name="op3")
+        op4_node = onnx.helper.make_node("Tanh", ["op2_out"], ["op4_out"], name="op4")
+        op5_node = onnx.helper.make_node("Mul", ["op3_out", "op4_out"], ["op5_out"], name="op5")
+        op6_node = onnx.helper.make_node("Relu", ["op5_out"], ["output_0"], name="op6")
+        op7_node = onnx.helper.make_node("Cos", ["op2_out"], ["output_1"], name="op7")
+        op8_node = onnx.helper.make_node("Sigmoid", ["op2_out"], ["output_2"], name="op8")
+
+        graph = onnx.helper.make_graph(
+            [
+                op1_node,
+                op2_node,
+                op3_node,
+                op4_node,
+                op5_node,
+                op6_node,
+                op7_node,
+                op8_node,
+            ],
+            "mixed_prec_test",
+            [input_0, input_1],
+            [output_0, output_1, output_2],
+        )
+        opset_imports = [
+            onnx.helper.make_opsetid("", 18),
+        ]
+        model = onnx.helper.make_model(graph, opset_imports=opset_imports)
+        return onnx.shape_inference.infer_shapes(model)
+
+    def test_16bit_subgraph(self):
+        """
+        Test correctness of a qdq model that uses a default 8-bit quantization type and contains
+        a subgraph that uses 16-bit activations.
+        """
+        shape = (1, 2, 3)
+        f32_model_path = os.path.join(self._tmp_dir_path, "model.onnx")
+        qdq_model_path = os.path.join(self._tmp_dir_path, "model.qdq.onnx")
+        qdq_mixed_model_path = os.path.join(self._tmp_dir_path, "model.mixed.qdq.onnx")
+        f32_model = self.build_test_model_1(shape)
+        onnx.save_model(f32_model, f32_model_path)
+
+        data_reader = self.input_feeds(3, {"input_0": shape, "input_1": shape})
+
+        # Create pure 8-bit qdq model
+        quantize_static(
+            f32_model_path,
+            qdq_model_path,
+            data_reader,
+            quant_format=QuantFormat.QDQ,
+            activation_type=QuantType.QUInt8,
+            op_types_to_quantize=[node.op_type for node in f32_model.graph.node],
+        )
+
+        # Create mixed precision 8-bit/16-bit qdq model
+        mixed_prec_overrides = {
+            "op2_out": [
+                {"quant_type": QuantType.QUInt8, "convert": {"quant_type": QuantType.QUInt16, "recv_nodes": {"op4"}}}
+            ],
+            "op3_out": [
+                {"quant_type": QuantType.QUInt8, "convert": {"quant_type": QuantType.QUInt16, "recv_nodes": {"op5"}}}
+            ],
+            "op4_out": [{"quant_type": QuantType.QUInt16}],
+            "op5_out": [{"quant_type": QuantType.QUInt16}],
+            "output_0": [{"quant_type": QuantType.QUInt16}],
+        }
+        data_reader.rewind()
+        quantize_static(
+            f32_model_path,
+            qdq_mixed_model_path,
+            data_reader,
+            quant_format=QuantFormat.QDQ,
+            activation_type=QuantType.QUInt8,
+            op_types_to_quantize=[node.op_type for node in f32_model.graph.node],
+            extra_options={"TensorQuantOverrides": mixed_prec_overrides},
+        )
+
+        qop_nodes = {"Relu": 0, "QuantizeLinear": 11, "DequantizeLinear": 12}
+        check_op_type_count(self, qdq_mixed_model_path, **qop_nodes)
+        data_reader.rewind()
+        check_model_correctness(self, f32_model_path, qdq_mixed_model_path, data_reader.get_next())
+        data_reader.rewind()
+        check_model_correctness(self, f32_model_path, qdq_model_path, data_reader.get_next())
 
 
 if __name__ == "__main__":
