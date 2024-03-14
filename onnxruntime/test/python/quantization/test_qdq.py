@@ -813,9 +813,304 @@ class TestQDQMixedPrecision(TestQDQFormat):
         qop_nodes = {"Relu": 0, "QuantizeLinear": 11, "DequantizeLinear": 12}
         check_op_type_count(self, qdq_mixed_model_path, **qop_nodes)
         data_reader.rewind()
-        check_model_correctness(self, f32_model_path, qdq_model_path, data_reader.get_next())
-        data_reader.rewind()
         check_model_correctness(self, f32_model_path, qdq_mixed_model_path, data_reader.get_next())
+        data_reader.rewind()
+        check_model_correctness(self, f32_model_path, qdq_model_path, data_reader.get_next())
+
+    def build_test_model_for_add_qdq_ops(self, shape, num_consumers, is_graph_output):
+        """
+        Builds a float32 model with a single producer node and a configurable number of consumer nodes.
+        The tensor between the producer and consumers can be optionally made a graph output.
+
+                           +-> op_0_out (optional graph output)
+                           |
+        input_0 --> op_0 --+-> op_1 --> output_0
+                           |
+                           +-> op_2 --> output_1
+                           |
+                           ...
+                           |
+                           +-> op_{n} --> output_{n-1}
+        """
+        input_0 = onnx.helper.make_tensor_value_info("input_0", onnx.TensorProto.FLOAT, shape)
+
+        outputs = []
+        for i in range(num_consumers):
+            outputs.append(onnx.helper.make_tensor_value_info(f"output_{i}", onnx.TensorProto.FLOAT, shape))
+
+        if is_graph_output:
+            outputs.append(onnx.helper.make_tensor_value_info("op_0_out", onnx.TensorProto.FLOAT, shape))
+
+        nodes = [onnx.helper.make_node("Sigmoid", ["input_0"], ["op_0_out"], name="op_0")]
+        for i in range(num_consumers):
+            op_index = i + 1
+            nodes.append(onnx.helper.make_node("Cos", ["op_0_out"], [f"output_{i}"], name=f"op_{op_index}"))
+
+        graph = onnx.helper.make_graph(
+            nodes,
+            "test_add_qdq_ops_for_converted_activation",
+            [input_0],
+            outputs,
+        )
+        opset_imports = [
+            onnx.helper.make_opsetid("", 18),
+        ]
+        model = onnx.helper.make_model(graph, opset_imports=opset_imports)
+        return onnx.shape_inference.infer_shapes(model)
+
+    def test_add_tensor_qdq_ops_case_1(self):
+        """
+        Tensor T is not a graph output; all consumers use the converted type
+        <Producer> ---> Q1 ---> DQ1 ---> Q2 ---> DQ2 ---> <Consumers>
+        """
+        shape = (1, 2, 3)
+        f32_model_path = "model_case_1.onnx"
+        qdq_model_path = "model_case_1.qdq.onnx"
+        f32_model = self.build_test_model_for_add_qdq_ops(shape, 2, False)
+        onnx.save_model(f32_model, f32_model_path)
+
+        data_reader = self.input_feeds(3, {"input_0": shape})
+
+        mixed_prec_overrides = {
+            "op_0_out": [
+                {
+                    "quant_type": QuantType.QUInt8,
+                    "convert": {"quant_type": QuantType.QUInt16, "recv_nodes": {"op_1", "op_2"}},
+                }
+            ],
+            "output_0": [{"quant_type": QuantType.QUInt16}],
+            "output_1": [{"quant_type": QuantType.QUInt16}],
+        }
+        quantize_static(
+            f32_model_path,
+            qdq_model_path,
+            data_reader,
+            quant_format=QuantFormat.QDQ,
+            activation_type=QuantType.QUInt8,
+            op_types_to_quantize=[node.op_type for node in f32_model.graph.node],
+            extra_options={"TensorQuantOverrides": mixed_prec_overrides},
+        )
+
+        # Expect the following QDQ model:
+        # input_0 --> Q --> DQ --> op_0 --> Q_8 --> DQ_8 --> Q_16 --> DQ_16 -+-> op_1 --> Q --> DQ --> output_0
+        #                                                                    |
+        #                                                                    +-> op_2 --> Q --> DQ --> output_1
+        qdq_node_counts = {"QuantizeLinear": 5, "DequantizeLinear": 5}
+        check_op_type_count(self, qdq_model_path, **qdq_node_counts)
+
+        qdq_model = onnx.load_model(qdq_model_path)
+        onnx.checker.check_model(qdq_model, True)
+
+        initializers = {init.name: init for init in qdq_model.graph.initializer}
+
+        # Check zero-point data types
+        orig_zp_init = initializers["op_0_out_zero_point"]
+        self.assertEqual(orig_zp_init.data_type, onnx.TensorProto.UINT8)
+        convert_zp_init = initializers["op_0_out_zero_point_convert"]
+        self.assertEqual(convert_zp_init.data_type, onnx.TensorProto.UINT16)
+        output_0_zp_init = initializers["output_0_zero_point"]
+        self.assertEqual(output_0_zp_init.data_type, onnx.TensorProto.UINT16)
+        output_1_zp_init = initializers["output_1_zero_point"]
+        self.assertEqual(output_1_zp_init.data_type, onnx.TensorProto.UINT16)
+
+    def test_add_tensor_qdq_ops_case_2(self):
+        """
+        Tensor T is not a graph output; some consumers use the original type, others use the converted type
+        <Producer> ---> Q1 -+-> DQ1 ---> <Consumers of original type>
+                            |
+                            +-> DQ1' ---> Q2 ---> DQ2 ---> <Consumers of converted type>
+        """
+        shape = (1, 2, 3)
+        f32_model_path = "model_case_2.onnx"
+        qdq_model_path = "model_case_2.qdq.onnx"
+        f32_model = self.build_test_model_for_add_qdq_ops(shape, 4, False)
+        onnx.save_model(f32_model, f32_model_path)
+
+        data_reader = self.input_feeds(3, {"input_0": shape})
+
+        mixed_prec_overrides = {
+            "op_0_out": [
+                {
+                    "quant_type": QuantType.QUInt8,
+                    "convert": {"quant_type": QuantType.QUInt16, "recv_nodes": {"op_3", "op_4"}},
+                }
+            ],
+            "output_2": [{"quant_type": QuantType.QUInt16}],
+            "output_3": [{"quant_type": QuantType.QUInt16}],
+        }
+        quantize_static(
+            f32_model_path,
+            qdq_model_path,
+            data_reader,
+            quant_format=QuantFormat.QDQ,
+            activation_type=QuantType.QUInt8,
+            op_types_to_quantize=[node.op_type for node in f32_model.graph.node],
+            extra_options={"TensorQuantOverrides": mixed_prec_overrides},
+        )
+
+        # Expect the following QDQ model:
+        # input_0 --> Q --> DQ --> op_0 --> Q_8 -+-> DQ_8 -+-> op_1 --> Q --> DQ --> output_0
+        #                                        |         |
+        #                                        |         +-> op_2 --> Q --> DQ --> output_1
+        #                                        |
+        #                                        +-> DQ_8' --> Q_16 --> DQ_16 -+-> op_3 --> Q --> DQ --> output_2
+        #                                                                      |
+        #                                                                      +-> op_4 --> Q --> DQ --> output_3
+        qdq_node_counts = {"QuantizeLinear": 7, "DequantizeLinear": 8}
+        check_op_type_count(self, qdq_model_path, **qdq_node_counts)
+
+        qdq_model = onnx.load_model(qdq_model_path)
+        onnx.checker.check_model(qdq_model, True)
+
+        initializers = {init.name: init for init in qdq_model.graph.initializer}
+
+        # Check zero-point data types
+        orig_zp_init = initializers["op_0_out_zero_point"]
+        self.assertEqual(orig_zp_init.data_type, onnx.TensorProto.UINT8)
+        convert_zp_init = initializers["op_0_out_zero_point_convert"]
+        self.assertEqual(convert_zp_init.data_type, onnx.TensorProto.UINT16)
+        output_0_zp_init = initializers["output_0_zero_point"]
+        self.assertEqual(output_0_zp_init.data_type, onnx.TensorProto.UINT8)
+        output_1_zp_init = initializers["output_1_zero_point"]
+        self.assertEqual(output_1_zp_init.data_type, onnx.TensorProto.UINT8)
+        output_2_zp_init = initializers["output_2_zero_point"]
+        self.assertEqual(output_2_zp_init.data_type, onnx.TensorProto.UINT16)
+        output_3_zp_init = initializers["output_3_zero_point"]
+        self.assertEqual(output_3_zp_init.data_type, onnx.TensorProto.UINT16)
+
+    def test_add_tensor_qdq_ops_case_3(self):
+        """
+        Tensor T is a graph output; all consumers use the converted type
+        <Producer> ---> Q1 ---> DQ1 ---> Q2 ---> DQ2 -+-> <Consumers>
+                                                      |
+                                                      +-> <Graph output>
+        """
+        shape = (1, 2, 3)
+        f32_model_path = "model_case_3.onnx"
+        qdq_model_path = "model_case_3.qdq.onnx"
+        f32_model = self.build_test_model_for_add_qdq_ops(shape, 2, True)
+        onnx.save_model(f32_model, f32_model_path)
+
+        data_reader = self.input_feeds(3, {"input_0": shape})
+
+        mixed_prec_overrides = {
+            "op_0_out": [
+                {
+                    "quant_type": QuantType.QUInt8,
+                    "convert": {"quant_type": QuantType.QUInt16, "recv_nodes": {"op_1", "op_2"}},
+                }
+            ],
+            "output_0": [{"quant_type": QuantType.QUInt16}],
+            "output_1": [{"quant_type": QuantType.QUInt16}],
+        }
+        quantize_static(
+            f32_model_path,
+            qdq_model_path,
+            data_reader,
+            quant_format=QuantFormat.QDQ,
+            activation_type=QuantType.QUInt8,
+            op_types_to_quantize=[node.op_type for node in f32_model.graph.node],
+            extra_options={"TensorQuantOverrides": mixed_prec_overrides},
+        )
+
+        # Expect the following QDQ model:
+        # input_0 --> Q --> DQ --> op_0 --> Q_8 --> DQ_8 --> Q_16 --> DQ_16 -+-> op_1 --> Q --> DQ --> output_0
+        #                                                                    |
+        #                                                                    +-> op_2 --> Q --> DQ --> output_1
+        #                                                                    |
+        #                                                                    +--> op_0_out (is graph output)
+        qdq_node_counts = {"QuantizeLinear": 5, "DequantizeLinear": 5}
+        check_op_type_count(self, qdq_model_path, **qdq_node_counts)
+
+        qdq_model = onnx.load_model(qdq_model_path)
+        onnx.checker.check_model(qdq_model, True)
+
+        initializers = {init.name: init for init in qdq_model.graph.initializer}
+        graph_outputs = {g_output.name: g_output for g_output in qdq_model.graph.output}
+
+        # Check zero-point data types
+        orig_zp_init = initializers["op_0_out_zero_point"]
+        self.assertEqual(orig_zp_init.data_type, onnx.TensorProto.UINT8)
+        convert_zp_init = initializers["op_0_out_zero_point_convert"]
+        self.assertEqual(convert_zp_init.data_type, onnx.TensorProto.UINT16)
+        output_0_zp_init = initializers["output_0_zero_point"]
+        self.assertEqual(output_0_zp_init.data_type, onnx.TensorProto.UINT16)
+        output_1_zp_init = initializers["output_1_zero_point"]
+        self.assertEqual(output_1_zp_init.data_type, onnx.TensorProto.UINT16)
+
+        self.assertIn("op_0_out", graph_outputs)
+
+    def test_add_tensor_qdq_ops_case_4(self):
+        """
+        Tensor T is a graph output; some consumers use the original type, others use the converted type
+        <Producer> ---> Q1 -+-> DQ1 -+-> <Consumers of original type>
+                            |        |
+                            |        +-> <Graph output>
+                            |
+                            +-> DQ1' ---> Q2 ---> DQ2 ---> <Consumers of converted type>
+        """
+        shape = (1, 2, 3)
+        f32_model_path = "model_case_4.onnx"
+        qdq_model_path = "model_case_4.qdq.onnx"
+        f32_model = self.build_test_model_for_add_qdq_ops(shape, 4, True)
+        onnx.save_model(f32_model, f32_model_path)
+
+        data_reader = self.input_feeds(3, {"input_0": shape})
+
+        mixed_prec_overrides = {
+            "op_0_out": [
+                {
+                    "quant_type": QuantType.QUInt8,
+                    "convert": {"quant_type": QuantType.QUInt16, "recv_nodes": {"op_3", "op_4"}},
+                }
+            ],
+            "output_2": [{"quant_type": QuantType.QUInt16}],
+            "output_3": [{"quant_type": QuantType.QUInt16}],
+        }
+        quantize_static(
+            f32_model_path,
+            qdq_model_path,
+            data_reader,
+            quant_format=QuantFormat.QDQ,
+            activation_type=QuantType.QUInt8,
+            op_types_to_quantize=[node.op_type for node in f32_model.graph.node],
+            extra_options={"TensorQuantOverrides": mixed_prec_overrides},
+        )
+
+        # Expect the following QDQ model:
+        # input_0 --> Q --> DQ --> op_0 --> Q_8 -+-> DQ_8 -+-> op_1 --> Q --> DQ --> output_0
+        #                                        |         |
+        #                                        |         +-> op_2 --> Q --> DQ --> output_1
+        #                                        |         |
+        #                                        |         +-> op_0_out (is graph output)
+        #                                        |
+        #                                        +-> DQ_8' --> Q_16 --> DQ_16 -+-> op_3 --> Q --> DQ --> output_2
+        #                                                                      |
+        #                                                                      +-> op_4 --> Q --> DQ --> output_3
+        qdq_node_counts = {"QuantizeLinear": 7, "DequantizeLinear": 8}
+        check_op_type_count(self, qdq_model_path, **qdq_node_counts)
+
+        qdq_model = onnx.load_model(qdq_model_path)
+        onnx.checker.check_model(qdq_model, True)
+
+        initializers = {init.name: init for init in qdq_model.graph.initializer}
+        graph_outputs = {g_output.name: g_output for g_output in qdq_model.graph.output}
+
+        # Check zero-point data types
+        orig_zp_init = initializers["op_0_out_zero_point"]
+        self.assertEqual(orig_zp_init.data_type, onnx.TensorProto.UINT8)
+        convert_zp_init = initializers["op_0_out_zero_point_convert"]
+        self.assertEqual(convert_zp_init.data_type, onnx.TensorProto.UINT16)
+        output_0_zp_init = initializers["output_0_zero_point"]
+        self.assertEqual(output_0_zp_init.data_type, onnx.TensorProto.UINT8)
+        output_1_zp_init = initializers["output_1_zero_point"]
+        self.assertEqual(output_1_zp_init.data_type, onnx.TensorProto.UINT8)
+        output_2_zp_init = initializers["output_2_zero_point"]
+        self.assertEqual(output_2_zp_init.data_type, onnx.TensorProto.UINT16)
+        output_3_zp_init = initializers["output_3_zero_point"]
+        self.assertEqual(output_3_zp_init.data_type, onnx.TensorProto.UINT16)
+
+        self.assertIn("op_0_out", graph_outputs)
 
 
 if __name__ == "__main__":

@@ -537,23 +537,23 @@ class QDQQuantizer(BaseQuantizer):
 
         This function handles the following scenarios:
 
-        A) Tensor T is not a graph output; all consumers use the converted type
+        1) Tensor T is not a graph output; all consumers use the converted type
 
             <Producer> ---> Q1 ---> DQ1 ---> Q2 ---> DQ2 ---> <Consumers>
 
-        B) Tensor T is not a graph output; some consumers use the original type, others use the converted type
+        2) Tensor T is not a graph output; some consumers use the original type, others use the converted type
 
             <Producer> ---> Q1 -+-> DQ1 ---> <Consumers of original type>
                                 |
                                 +-> DQ1' ---> Q2 ---> DQ2 ---> <Consumers of converted type>
 
-        C) Tensor T is a graph output; all consumers use the converted type
+        3) Tensor T is a graph output; all consumers use the converted type
 
             <Producer> ---> Q1 ---> DQ1 ---> Q2 ---> DQ2 -+-> <Consumers>
                                                           |
                                                           +-> <Graph output>
 
-        D) Tensor T is a graph output; some consumers use the original type, others use the converted type
+        4) Tensor T is a graph output; some consumers use the original type, others use the converted type
 
             <Producer> ---> Q1 -+-> DQ1 -+-> <Consumers of original type>
                                 |        |
