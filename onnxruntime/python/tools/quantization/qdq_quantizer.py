@@ -527,6 +527,40 @@ class QDQQuantizer(BaseQuantizer):
         convert_zp_name,
         convert_recv_nodes,
     ):
+        """
+        Adds Q and DQ ops to a tensor whose quantized data type is converted. That is, some consumers may use the
+        original data type from the producer, while other consumers use the converted data type.
+        This is generally done by adding a sequence of ops that convert from one data type (e.g., uint8) to another (e.g., uint16).
+
+        T_float ---> Quant(to u8) ---> Convert(to u16) ---> Dequant(to float) ---> T_float'
+        where Convert(to u16) is equivalent to: ---> Dequant(to float) ---> Quant(to u16) --->
+
+        This function handles the following scenarios:
+
+        A) Tensor T is not a graph output; all consumers use the converted type
+
+            <Producer> ---> Q1 ---> DQ1 ---> Q2 ---> DQ2 ---> <Consumers>
+
+        B) Tensor T is not a graph output; some consumers use the original type, others use the converted type
+
+            <Producer> ---> Q1 -+-> DQ1 ---> <Consumers of original type>
+                                |
+                                +-> DQ1' ---> Q2 ---> DQ2 ---> <Consumers of converted type>
+
+        C) Tensor T is a graph output; all consumers use the converted type
+
+            <Producer> ---> Q1 ---> DQ1 ---> Q2 ---> DQ2 -+-> <Consumers>
+                                                          |
+                                                          +-> <Graph output>
+
+        D) Tensor T is a graph output; some consumers use the original type, others use the converted type
+
+            <Producer> ---> Q1 -+-> DQ1 -+-> <Consumers of original type>
+                                |        |
+                                |        +-> <Graph output>
+                                |
+                                +-> DQ1' ---> Q2 ---> DQ2 ---> <Consumers of converted type>
+        """
         tensor_recv_nodes = set([node.name for node in self.tensor_to_its_receiving_nodes[tensor_name]])
 
         if (
@@ -534,6 +568,7 @@ class QDQQuantizer(BaseQuantizer):
             and tensor_name in self.tensor_to_its_receiving_nodes
             and len(self.tensor_to_its_receiving_nodes[tensor_name]) > 1
         ):
+            # TODO: Add support for dedicated_qdq_pair if/when needed.
             raise ValueError(
                 "Do not currently support converted quant_types in TensorQuantOverrides when the `dedicated_qdq_pair` extra_option is enabled"
             )
@@ -651,6 +686,7 @@ class QDQQuantizer(BaseQuantizer):
                         )
 
                     if quant_params_initializers.converted is None:
+                        # Normal case: <producer> --> Q --> DQ --> <consumers>
                         self._add_qdq_pair_for_activation(
                             tensor_name,
                             quant_params_initializers.original.scale.name,
@@ -658,6 +694,9 @@ class QDQQuantizer(BaseQuantizer):
                             data_type=tensor_info.data_type,
                         )
                     else:
+                        # Conversion case: <producer> ---> Q1 -+-> DQ1 --> <consumers of original type>
+                        #                                      |
+                        #                                      +-> DQ1' --> Q2 --> DQ2 --> <consumers of converted type>
                         assert tensor_info.data_type == quant_params_initializers.original.scale.data_type
                         self._add_qdq_ops_for_converted_activation(
                             tensor_name,
@@ -695,7 +734,15 @@ class QDQQuantizer(BaseQuantizer):
                             )
                             converted_recv_nodes = tensor_params.converted_recv_nodes
 
-                    if converted_qparam_inits is not None:
+                    if converted_qparam_inits is None:
+                        # Normal case: <producer> --> Q_shared --> DQ_shared --> <consumers>
+                        self._add_qdq_pair_for_activation(
+                            tensor_name, quantized_value.scale_name, quantized_value.zp_name
+                        )
+                    else:
+                        # Conversion case: <producer> ---> Q_shared -+-> DQ_shared --> <consumers of original type>
+                        #                                            |
+                        #                                            +-> DQ1' --> Q2 --> DQ2 --> <consumers of converted type>
                         self._add_qdq_ops_for_converted_activation(
                             tensor_name,
                             quantized_value.scale_name,
@@ -704,10 +751,6 @@ class QDQQuantizer(BaseQuantizer):
                             converted_qparam_inits.scale.name,
                             converted_qparam_inits.zero_point.name,
                             converted_recv_nodes,
-                        )
-                    else:
-                        self._add_qdq_pair_for_activation(
-                            tensor_name, quantized_value.scale_name, quantized_value.zp_name
                         )
 
     def _quantize_bias_tensors(self):
