@@ -55,6 +55,8 @@ class QDQQuantParamProvider:
     node_name: str
 
 
+# Holds information for tensors that have been marked for quantization by operator quantizers.
+# Does not hold information for bias tensors.
 class QDQTensorQuantInfo:
     def __init__(self, tensor_type=QDQQuantTensorType.ACTIVATION, quant_para_provider=None, axis=None, data_type=None):
         self.tensor_type = tensor_type
@@ -65,6 +67,7 @@ class QDQTensorQuantInfo:
         self.data_type = data_type
 
 
+# Holds information for bias tensors that have been marked for quantization by operator quantizers.
 @dataclass
 class QDQBiasQuantInfo:
     node_name: str
@@ -375,7 +378,10 @@ class QDQQuantizer(BaseQuantizer):
         scale_name: str,
         zp_name: str,
         axis: int | None = None,
-    ) -> onnx.NodeProto:
+    ):
+        """
+        Creates a QuantizeLinear node and adds it to the model.
+        """
         qlinear_node = onnx.helper.make_node(
             QUANT_OP_NAME,
             [q_input, scale_name, zp_name],
@@ -394,7 +400,10 @@ class QDQQuantizer(BaseQuantizer):
         scale_name: str,
         zp_name: str,
         axis: int | None = None,
-    ) -> onnx.NodeProto:
+    ):
+        """
+        Creates a DequantizeLinear node and adds it to the model.
+        """
         dequant_node = onnx.helper.make_node(
             DEQUANT_OP_NAME,
             [dq_input, scale_name, zp_name],
@@ -638,9 +647,13 @@ class QDQQuantizer(BaseQuantizer):
             first_q_output, first_dq_output, add_dequant_suffix(tensor_name), first_scale_name, first_zp_name
         )
 
-        # Create parallel clone of first DQ op if some nodes use the original quantized type.
-        # This DQ clone would only have one consumer Q node and could be potentially fused with
-        # it (the Q op) without breaking "node units".
+        # Create parallel clone of first DQ op if _not all_ consumers use the converted type.
+        # --> DQ1' --> Q2 --> DQ2 --> <Consumers of converted type>
+        #
+        # This DQ clone would only have one consumer Q node (Q2) and could be potentially fused with
+        # it by some EPs (e.g., QNN) without breaking other "node units".
+        # Ex QNN fusion:
+        # --> Convert (fused) --> DQ2 --> <Consumers of converted type>
         second_q_input = first_dq_output
         if not all_use_converted:
             second_q_input = add_quant_input_suffix(f"{tensor_name}_convert")
@@ -708,39 +721,44 @@ class QDQQuantizer(BaseQuantizer):
                 if initializer:
                     self._add_qdq_pair_for_initializer(initializer, tensor_info.tensor_type, tensor_info.axis)
                 else:
-                    quant_params_initializers = self._make_tensor_scale_zp_initializers(tensor_name)
-                    if not quant_params_initializers:
+                    tensor_qparam_initializers = self._make_tensor_scale_zp_initializers(tensor_name)
+                    if not tensor_qparam_initializers:
                         raise ValueError(
                             f"Quantization parameters are not specified for param {tensor_name}. "
                             "In static mode quantization params for inputs and outputs of nodes to be quantized are required."
                         )
 
-                    if quant_params_initializers.converted is None:
+                    if tensor_qparam_initializers.converted is None:
                         # Normal case: <producer> --> Q --> DQ --> <consumers>
                         self._add_qdq_pair_for_activation(
                             tensor_name,
-                            quant_params_initializers.original.scale.name,
-                            quant_params_initializers.original.zero_point.name,
+                            tensor_qparam_initializers.original.scale.name,
+                            tensor_qparam_initializers.original.zero_point.name,
                             data_type=tensor_info.data_type,
                         )
                     else:
                         # Conversion case: <producer> ---> Q1 -+-> DQ1 --> <consumers of original type>
                         #                                      |
                         #                                      +-> DQ1' --> Q2 --> DQ2 --> <consumers of converted type>
-                        assert tensor_info.data_type == quant_params_initializers.original.scale.data_type
+                        assert tensor_info.data_type == tensor_qparam_initializers.original.scale.data_type
                         self._add_qdq_ops_for_converted_activation(
                             tensor_name,
-                            quant_params_initializers.original.scale.name,
-                            quant_params_initializers.original.zero_point.name,
+                            tensor_qparam_initializers.original.scale.name,
+                            tensor_qparam_initializers.original.zero_point.name,
                             tensor_info.data_type,
-                            quant_params_initializers.converted.scale.name,
-                            quant_params_initializers.converted.zero_point.name,
-                            quant_params_initializers.converted_recv_nodes,
+                            tensor_qparam_initializers.converted.scale.name,
+                            tensor_qparam_initializers.converted.zero_point.name,
+                            tensor_qparam_initializers.converted_recv_nodes,
                         )
 
                 del self.tensors_to_quantize[tensor_name]
 
     def _quantize_sharing_param_tensors(self):
+        """
+        Quantizes tensors that want to use the quantization parameter initializers from an upstream tensor.
+        For example, a Transpose node's output tensor will typically want to use the same quantization parameter
+        initializers as the Transpose node's input.
+        """
         while self.tensors_to_quantize:
             for tensor_name, tensor_info in self.tensors_to_quantize.copy().items():
                 quant_provider = tensor_info.quant_para_provider
@@ -753,7 +771,8 @@ class QDQQuantizer(BaseQuantizer):
                     if self.is_input_a_initializer(tensor_name):
                         raise ValueError("Quantization parameter shared mode is not supported for weight yet")
 
-                    # Don't overlook potential conversion at the output.
+                    # Need to check if this tensor's quant_type is converted for some consumers.
+                    # If so, create new scale/zp initializers for these consumers.
                     converted_qparam_inits = None
                     converted_recv_nodes = None
                     if tensor_name in self.quantization_params:
