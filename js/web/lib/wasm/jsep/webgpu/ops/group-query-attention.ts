@@ -1,25 +1,21 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-import {DataType} from '../../../wasm-common';
 import {TensorView} from '../../tensor-view';
-import {ShapeUtil} from '../../util';
 import {createAttributeWithCacheKey} from '../attribute-with-cache-key';
-import {ComputeContext, GpuDataType, ProgramUniform} from '../types';
+import {ComputeContext} from '../types';
 
-import {applyAttention, AttentionAttrs, AttentionMaskType, AttentionParameters, AttentionQkvFormat} from './attention';
-import {inputVariable, outputVariable, ShaderHelper, UniformsArrayType} from './common';
+import {AttentionAttrs, AttentionMaskType, AttentionParameters, AttentionQkvFormat, computeAttentionProbs, computeVxAttentionScore} from './attention';
+import {maybeTransposeToBNSHAndAddBias} from './multi-head-attentiion';
+import {createTileProgramInfo} from './tile';
 import {createTransposeProgramInfo, TransposeAttributes} from './transpose';
 
-const validateInputs = (inputs: readonly TensorView[], attributes: AttentionAttrs): AttentionParameters => {
+export const validateInputs = (inputs: readonly TensorView[], attributes: AttentionAttrs): AttentionParameters => {
   const query = inputs[0];
   const key = inputs[1];
   const value = inputs[2];
-  const bias = inputs[3];
-  const keyPaddingMask = inputs[4];
-  const relativePositionBias = inputs[5];
-  const pastKey = inputs[6];
-  const pastValue = inputs[7];
+  const pastKey = inputs[3];
+  const pastValue = inputs[4];
 
   // Abbreviation and Meanings:
   //   B:    batch_size
@@ -35,25 +31,20 @@ const validateInputs = (inputs: readonly TensorView[], attributes: AttentionAttr
   //   D:    hidden size for Q and K (D = N * H), aka q_hidden_size or k_hidden_size or qk_hidden_size
   //   D_v:  v_hidden_size = num_heads * v_head_size
 
-  //     key_padding_mask (K/V)     : (B) or (2*B + 1) or (B, L) or None
-  //     relative_position_bias     : (B, 1, S, L)
   //     past_key                   : (B, N, S*, H)
   //     past_value                 : (B, N, S*, H)
   // When no packing for q/k/v:
   //     query            (Q)       : (B, S, D)
   //     key              (K)       : (B, L, D) or (B, N, S*, H)
   //     value            (V)       : (B, L, D_v) or (B, N, S*, H)
-  //     bias             (Q/K/V)   : (D + D + D_v)
   // When packed kv is used:
   //     query            (Q)       : (B, S, D)
   //     key              (K)       : (B, L, N, 2, H)
   //     value            (V)       : None
-  //     bias             (Q/K/V)   : None
   // When packed qkv is used:
   //     query            (Q)       : (B, L, N, 3, H) or (B, S, 3*D)
   //     key              (K)       : None
   //     value            (V)       : None
-  //     bias             (Q/K/V)   : None or (D + D + D_v)
 
   if (query.dims.length !== 3 && query.dims.length !== 5) {
     throw new Error('Input query is expected to have 3 or 5 dimensions');
@@ -95,8 +86,8 @@ const validateInputs = (inputs: readonly TensorView[], attributes: AttentionAttr
     }
 
     if (key.dims.length === 3) {
-      if (key.dims[2] !== query.dims[2]) {
-        throw new Error('Input "query" and "key" shall have same dim 2 (hidden_size)');
+      if (query.dims[2] % key.dims[2] !== 0) {
+        throw new Error('Dimension 2 of "query" should be a multiple of "key"');
       }
       qkvFormat = AttentionQkvFormat.qkvBSNH;
       kvSequenceLength = key.dims[1];
@@ -128,37 +119,7 @@ const validateInputs = (inputs: readonly TensorView[], attributes: AttentionAttr
     qkvFormat = AttentionQkvFormat.qkvBSN3H;
   }
 
-  if (bias) {
-    if (bias.dims.length !== 1) {
-      throw new Error('Input "bias" is expected to have 1 dimension');
-    }
-
-    if (value) {
-      if (query.dims.length === 5 && query.dims[3] === 2) {
-        throw new Error('bias is not allowed for packed kv.');
-      }
-    }
-  }
-
-  let maskType: AttentionMaskType = AttentionMaskType.none;
-  if (keyPaddingMask) {
-    maskType = AttentionMaskType.maskUnknown;
-    const maskDims = keyPaddingMask.dims;
-    if (maskDims.length === 1) {
-      if (maskDims[0] === batchSize) {
-        maskType = AttentionMaskType.mask1dKeySeqLen;
-      } else if (maskDims[0] === 3 * batchSize + 2) {
-        maskType = AttentionMaskType.mask1DKeySeqLenStart;
-      }
-    } else if (maskDims.length === 2 && maskDims[0] === batchSize && maskDims[1] === kvSequenceLength) {
-      maskType = AttentionMaskType.mask2dKeyPadding;
-    }
-    if (maskType === AttentionMaskType.maskUnknown) {
-      throw new Error('Input "key_padding_mask" shape shall be (batch_size) or (batch_size, kv_sequence_length)');
-    }
-    throw new Error('Mask not supported');
-  }
-
+  const maskType: AttentionMaskType = AttentionMaskType.none;
   let passPastInKv = false;
   let vHiddenSize = hiddenSize;
   if (value) {
@@ -186,18 +147,7 @@ const validateInputs = (inputs: readonly TensorView[], attributes: AttentionAttr
 
   const totalSequenceLength = pastSequenceLength + kvSequenceLength;
   const broadcastResPosBias = false;
-  // if (extraAddQk) {
-  //   if (extraAddQk.dims[0] === 1) {
-  //     broadcastResPosBias = true;
-  //   }
-  // }
 
-  if (keyPaddingMask) {
-    throw new Error('Key padding mask is not supported');
-  }
-  if (relativePositionBias) {
-    throw new Error('extraAddQk is not supported');
-  }
   if (pastKey) {
     throw new Error('pastKey is not supported');
   }
@@ -205,6 +155,7 @@ const validateInputs = (inputs: readonly TensorView[], attributes: AttentionAttr
     throw new Error('pastValue is not supported');
   }
 
+  const kvNumHeads = attributes.kvNumHeads;
   return {
     batchSize,
     sequenceLength,
@@ -216,8 +167,9 @@ const validateInputs = (inputs: readonly TensorView[], attributes: AttentionAttr
     hiddenSize,
     vHiddenSize,
     headSize,
-    vHeadSize: Math.floor(vHiddenSize / attributes.numHeads),
+    vHeadSize: Math.floor(vHiddenSize / kvNumHeads!),
     numHeads: attributes.numHeads,
+    kvNumHeads,
     isUnidirectional: false,
     pastPresentShareBuffer: false,
     maskFilterValue: attributes.maskFilterValue,
@@ -229,81 +181,40 @@ const validateInputs = (inputs: readonly TensorView[], attributes: AttentionAttr
   };
 };
 
-export const parseMultiHeadAttentionAttributes = (attributes: AttentionAttrs): AttentionAttrs =>
+export const applyAttention =
+    (context: ComputeContext, q: TensorView, k: TensorView, v: TensorView, _maskIndex: TensorView|undefined,
+     _past: TensorView|undefined, _pastKey: TensorView|undefined, _pastValue: TensorView|undefined,
+     relativePositionBias: TensorView|undefined, parameters: AttentionParameters, nReps: number|undefined) => {
+      const probs = computeAttentionProbs(context, q, k, relativePositionBias, parameters, 1.0);
+
+      computeVxAttentionScore(context, probs, v, parameters, nReps);
+    };
+
+export const parseGroupQueryAttentionAttributes = (attributes: AttentionAttrs): AttentionAttrs =>
     createAttributeWithCacheKey({...attributes});
 
 const weightTransposeAttribute: TransposeAttributes = createAttributeWithCacheKey({perm: [0, 2, 1, 3]});
 
-const addBiasTranspose =
-    (context: ComputeContext, qkv: TensorView, bias: TensorView, batchSize: number, sequenceLength: number,
-     hiddenSize: number, biasOffset: number) => {
-      const outputShape = [batchSize, sequenceLength, hiddenSize];
-      const outputSize = ShapeUtil.size(outputShape);
-      const programUniforms: ProgramUniform[] = [
-        {type: DataType.uint32, data: outputSize}, {type: DataType.uint32, data: biasOffset},
-        {type: DataType.uint32, data: hiddenSize}
-      ];
+const maybeExpandAndTransposeToBNSH =
+    (context: ComputeContext, batchSize: number, numHeads: number, sequenceLength: number, headSize: number,
+     input: TensorView, nReps: number) => {
+      let reshapedInput = input;
+      if (input.dims.length === 3) {
+        reshapedInput = input.reshape([batchSize, sequenceLength, numHeads, headSize]);
+      }
+      if (nReps !== 1) {
+        reshapedInput = context.compute(
+            createTileProgramInfo([reshapedInput], [1, 1, 1, nReps]), {inputs: [reshapedInput], outputs: [-1]})[0];
 
-      const getShaderSource = (shaderHelper: ShaderHelper) => {
-        const output = outputVariable('qkv_with_bias', qkv.dataType, outputShape);
-        const qkvInput = inputVariable('qkv', qkv.dataType, outputShape);
-        const biasInput = inputVariable('bias', bias.dataType, outputShape);
-
-        const uniforms: UniformsArrayType = [
-          {name: 'output_size', type: 'u32'}, {name: 'bias_offset', type: 'u32'}, {name: 'hidden_size', type: 'u32'}
-        ];
-        return `
-  ${shaderHelper.registerUniforms(uniforms).declareVariables(qkvInput, biasInput, output)}
-  ${shaderHelper.mainStart()}
-    ${shaderHelper.guardAgainstOutOfBoundsWorkgroupSizes('uniforms.output_size')}
-    let bias_offset_idx = (global_idx % uniforms.hidden_size) + uniforms.bias_offset;
-
-    qkv_with_bias[global_idx] = qkv[global_idx] + bias[bias_offset_idx];
-  }`;
-      };
+        reshapedInput = reshapedInput.reshape([batchSize, sequenceLength, numHeads * nReps, headSize]);
+      }
 
       return context.compute(
-          {
-            name: 'MultiHeadAttentionAddBias',
-            shaderCache: {inputDependencies: ['type', 'type']},
-            getRunData: () => ({
-              outputs: [{dims: outputShape, dataType: qkv.dataType, gpuDataType: GpuDataType.default}],
-              dispatchGroup: {x: Math.ceil(outputSize / 64 /* workgroup size */)},
-              programUniforms
-            }),
-            getShaderSource,
-          },
-          {inputs: [qkv, bias], outputs: [-1]})[0];
+          createTransposeProgramInfo(reshapedInput, weightTransposeAttribute.perm),
+          {inputs: [reshapedInput], outputs: [-1]})[0];
     };
 
-export const maybeTransposeToBNSHAndAddBias =
-    (context: ComputeContext, batchSize: number, numHeads: number, sequenceLength: number, headSize: number,
-     input: TensorView, bias?: TensorView, biasOffset?: number) => {
-      // const newDims = [];
-
-      let reshapedInput = input;
-      if (!bias) {
-        if (input.dims.length === 3) {
-          reshapedInput = input.reshape([batchSize, sequenceLength, numHeads, headSize]);
-        }
-        return context.compute(
-            createTransposeProgramInfo(reshapedInput, weightTransposeAttribute.perm),
-            {inputs: [reshapedInput], outputs: [-1]})[0];
-      } else {
-        if (sequenceLength === 1) {
-          throw new Error('AddBiasReshape is not implemented. Please export your model with packed QKV or KV');
-        } else {
-          reshapedInput =
-              addBiasTranspose(context, input, bias, batchSize, sequenceLength, numHeads * headSize, biasOffset!);
-          reshapedInput = reshapedInput.reshape([batchSize, sequenceLength, numHeads, headSize]);
-          return context.compute(
-              createTransposeProgramInfo(reshapedInput, weightTransposeAttribute.perm),
-              {inputs: [reshapedInput], outputs: [-1]})[0];
-        }
-      }
-    };
-
-export const multiHeadAttention = (context: ComputeContext, attributes: AttentionAttrs): void => {
+export const groupQueryAttention = (context: ComputeContext, attributes: AttentionAttrs): void => {
   const params = validateInputs(context.inputs, attributes);
 
   if (context.inputs[0].dims.length === 5) {
@@ -314,29 +225,17 @@ export const multiHeadAttention = (context: ComputeContext, attributes: Attentio
     throw new Error('Packed KV is not implemented');
   }
 
-  // applyAttention expects BNSH inputs
-  const kvBNSH = context.inputs[1] && context.inputs[2] && context.inputs[1].dims.length === 4 &&
-      context.inputs[2].dims.length === 4;
-
   const Q = maybeTransposeToBNSHAndAddBias(
       context, params.batchSize, params.numHeads, params.sequenceLength, params.headSize, context.inputs[0],
       context.inputs[3], 0);
 
-  if (kvBNSH) {
-    return applyAttention(
-        context, Q, context.inputs[1], context.inputs[2], context.inputs[4], undefined, undefined, undefined,
-        context.inputs[5], params, attributes);
-  }
+  const nReps = Math.floor(attributes.numHeads / params.kvNumHeads!);
+  const K = maybeExpandAndTransposeToBNSH(
+      context, params.batchSize, params.kvNumHeads!, params.kvSequenceLength, params.vHeadSize, context.inputs[1],
+      nReps);
 
-  const K = maybeTransposeToBNSHAndAddBias(
-      context, params.batchSize, params.numHeads, params.kvSequenceLength, params.headSize, context.inputs[1],
-      context.inputs[3], params.hiddenSize);
-
-  const V = maybeTransposeToBNSHAndAddBias(
-      context, params.batchSize, params.numHeads, params.kvSequenceLength, params.vHeadSize, context.inputs[2],
-      context.inputs[3], 2 * params.hiddenSize);
-
-  applyAttention(
-      context, Q, K, V, context.inputs[4], undefined, context.inputs[6], context.inputs[7], context.inputs[5], params,
-      attributes);
+  const V = maybeExpandAndTransposeToBNSH(
+      context, params.batchSize, params.kvNumHeads!, params.kvSequenceLength, params.vHeadSize, context.inputs[2],
+      nReps);
+  applyAttention(context, Q, K, V, context.inputs[4], undefined, undefined, undefined, undefined, params, nReps);
 };
