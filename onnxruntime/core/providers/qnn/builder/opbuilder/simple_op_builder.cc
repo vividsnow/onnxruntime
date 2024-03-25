@@ -132,6 +132,25 @@ Status SimpleOpBuilder::ProcessInputs(QnnModelWrapper& qnn_model_wrapper,
                                           do_op_validation));
       input_names.push_back(convert_output_name);
     }
+
+    if (IsNpuBackend(qnn_model_wrapper.GetQnnBackendType())) {
+      // Provide bias input with default value 0
+      const auto& outputs = node_unit.Outputs();
+      TensorInfo output_info = {};
+      ORT_RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(outputs[0], output_info));
+      std::vector<uint32_t> matmul_output_shape = output_info.shape;
+      uint32_t bias_size = matmul_output_shape.back();
+      // QNN Matmul bias only supports UFIXED_POINT_8 & SFIXED_POINT_32, use SFIXED_POINT_32 here
+      std::vector<uint8_t> matmul_bias(bias_size * 4, 0);
+
+      std::string bias_input_name = inputs[0].node_arg.Name() + "_bias";
+      Qnn_QuantizeParams_t quantize_param = QNN_QUANTIZE_PARAMS_INIT;
+      std::vector<uint32_t> bias_shape{bias_size};
+      QnnTensorWrapper input_tensorwrapper(bias_input_name, QNN_TENSOR_TYPE_STATIC, QNN_DATATYPE_SFIXED_POINT_32,
+                                           quantize_param, std::move(bias_shape), std::move(matmul_bias));
+      ORT_RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(input_tensorwrapper)), "Failed to add tensor.");
+      input_names.push_back(bias_input_name);
+    }
   }
 
   return Status::OK();
