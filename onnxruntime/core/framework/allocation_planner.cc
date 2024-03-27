@@ -1174,7 +1174,7 @@ class PlannerImpl {
                 reused.insert(reusable_input);
                 continue;
               }  // if
-            }    // if
+            }  // if
           }
         }
 
@@ -1908,7 +1908,7 @@ class PlannerImpl {
                   }
                 }
               }  // output->Exists
-            }    // for each output
+            }  // for each output
             if (output_consumed_in_subgraph) {
               const auto downstream = node_stream_map_[it->Index()];
               if (downstream != i) {
@@ -2058,6 +2058,7 @@ class PlannerImpl {
     process_stream = [&](size_t i, int node_offset) {
       if (node_offset > execution_offsets[i])
         return;
+
       while (execution_offsets[i] < static_cast<int>(stream_nodes_[i].size())) {
         if (execution_offsets[i] == -1) {
           execution_offsets[i]++;
@@ -2107,7 +2108,10 @@ class PlannerImpl {
     for (size_t i = 0; i < stream_nodes_.size(); ++i) {
       process_stream(i, -1);
     }
-    ORT_ENFORCE(plan_.node_execution_order_in_training.size() == num_of_nodes);
+    ORT_ENFORCE(plan_.node_execution_order_in_training.size() == num_of_nodes,
+                "plan_.node_execution_order_in_training.size(): " +
+                    std::to_string(plan_.node_execution_order_in_training.size()) +
+                    ", num_of_nodes: " + std::to_string(num_of_nodes));
 #endif
 
     return Status::OK();

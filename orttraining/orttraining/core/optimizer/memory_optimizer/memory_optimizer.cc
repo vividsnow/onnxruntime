@@ -70,8 +70,6 @@ Status MemoryOptimizer::ParseOptimizationConfigFromString(const std::string& mem
 bool MemoryOptimizer::ModifyGraph(Graph& graph,
                                   const InlinedHashMap<NodeIndex, ptrdiff_t>&
                                       node_index_to_its_order_in_topological_sort_map,
-                                  const InlinedHashMap<const Node*, InlinedVector<size_t>>&
-                                      candidate_output_args_map,
                                   const logging::Logger& logger,
                                   ptrdiff_t boundary_op_order_in_topological_sort,
                                   Node* node,
@@ -97,47 +95,70 @@ bool MemoryOptimizer::ModifyGraph(Graph& graph,
           dynamic_cast<optimizer::memory_optimizer::NodeRecomputePlan*>(node_plan.get());
       ORT_ENFORCE(recompute_plan != nullptr);
       ORT_ENFORCE(CreateRecomputeGraph(graph, recompute_plan->GetNodesInTopoOrder(), logger, replacement_node_ptr).IsOK());
+
+      ORT_ENFORCE(replacement_node_ptr);
+
+      graph_is_modified = true;
+
+      auto connect_bw_ops_to_recomputed_activation = [&graph, &node_index_to_its_order_in_topological_sort_map, boundary_op_order_in_topological_sort](Node* node, size_t output_index, Node* replacement_node_ptr) {
+        // Collect output edges (connecting to backward ops), to remove.
+        std::vector<graph_utils::GraphEdge> output_edges;
+        for (auto it = node->OutputEdgesBegin(), end = node->OutputEdgesEnd(); it != end; ++it) {
+          size_t src_output_idx = static_cast<size_t>(it->GetSrcArgIndex());
+          if (src_output_idx != output_index) {
+            continue;
+          }
+
+          auto tid = node_index_to_its_order_in_topological_sort_map.find(it->GetNode().Index());
+          // It is possible the consumer node is newly added as the recompute node, so we need a check here.
+          // For those kinds of ops, we can treat them as backward ops.
+          if (tid == node_index_to_its_order_in_topological_sort_map.end() ||
+              !IsForwardPassOperator(node_index_to_its_order_in_topological_sort_map.at(tid->first),
+                                     boundary_op_order_in_topological_sort)) {
+            // Remove the edge only connecting to backward op.
+            output_edges.push_back(graph_utils::GraphEdge::CreateGraphEdge(*node, *it, false));
+          }
+        }
+
+        if (!output_edges.empty()) {
+          // Remove the output edges of the node first
+          graph_utils::GraphEdge::RemoveGraphEdges(graph, output_edges);
+
+          // Create connections between the replacement node and the outgoing nodes.
+          for (const auto& output_edge : output_edges) {
+            graph.RemoveConsumerNode(node->MutableOutputDefs()[output_index]->Name(), node);
+
+            // Add new edge connecting the input with the output nodes directly.
+            // This also updates the destination node's input node args
+            graph.AddEdge(replacement_node_ptr->Index(), output_edge.dst_node, static_cast<int>(output_index),
+                          output_edge.dst_arg_index);
+          }
+        }
+      };
+
+      if (recompute_probe_config_.enable_strict_layerwise_mode) {
+        // For strict layerwise mode, we will collect all outputs of the layers as the recomputed outputs.
+        for (const Node* n : recompute_plan->GetNodesInTopoOrder()) {
+          for (size_t output_index = 0; output_index < n->OutputDefs().size(); ++output_index) {
+            const NodeArg* recompute_arg = graph.GetNodeArg(graph_utils::RecomputeName(n->OutputDefs()[output_index]->Name()));
+            if (recompute_arg == nullptr) {
+              continue;
+            }
+            const Node* replacement_node_ptr = graph.GetProducerNode(recompute_arg->Name());
+            if (replacement_node_ptr == nullptr) {
+              continue;
+            }
+            connect_bw_ops_to_recomputed_activation(graph.GetNode(n->Index()), output_index, graph.GetNode(replacement_node_ptr->Index()));
+          }
+        }
+      } else {
+        for (size_t output_index : apply_context->output_indices) {
+          connect_bw_ops_to_recomputed_activation(node, output_index, replacement_node_ptr);
+        }
+      }
+
     } else {
       ORT_THROW("unsupported optimization type found.");
-    }
-    ORT_ENFORCE(replacement_node_ptr);
-
-    graph_is_modified = true;
-
-    for (size_t output_index : candidate_output_args_map.at(node)) {
-      // Collect output edges (connecting to backward ops), to remove.
-      std::vector<graph_utils::GraphEdge> output_edges;
-      for (auto it = node->OutputEdgesBegin(), end = node->OutputEdgesEnd(); it != end; ++it) {
-        size_t src_output_idx = static_cast<size_t>(it->GetSrcArgIndex());
-        if (src_output_idx != output_index) {
-          continue;
-        }
-
-        auto tid = node_index_to_its_order_in_topological_sort_map.find(it->GetNode().Index());
-        // It is possible the consumer node is newly added as the recompute node, so we need a check here.
-        // For those kinds of ops, we can treat them as backward ops.
-        if (tid == node_index_to_its_order_in_topological_sort_map.end() ||
-            !IsForwardPassOperator(node_index_to_its_order_in_topological_sort_map.at(tid->first),
-                                   boundary_op_order_in_topological_sort)) {
-          // Remove the edge only connecting to backward op.
-          output_edges.push_back(graph_utils::GraphEdge::CreateGraphEdge(*node, *it, false));
-        }
-      }
-
-      if (!output_edges.empty()) {
-        // Remove the output edges of the node first
-        graph_utils::GraphEdge::RemoveGraphEdges(graph, output_edges);
-
-        // Create connections between the replacement node and the outgoing nodes.
-        for (const auto& output_edge : output_edges) {
-          graph.RemoveConsumerNode(node->MutableOutputDefs()[output_index]->Name(), node);
-
-          // Add new edge connecting the input with the output nodes directly.
-          // This also updates the destination node's input node args
-          graph.AddEdge(replacement_node_ptr->Index(), output_edge.dst_node, static_cast<int>(output_index),
-                        output_edge.dst_arg_index);
-        }
-      }
     }
   }
 
@@ -235,8 +256,9 @@ Status MemoryOptimizer::ApplyImpl(Graph& graph, bool& modified, int /*graph_leve
 
     bool has_been_modified = false;
     if (node_to_opt_plan_map.find(p_node) != node_to_opt_plan_map.end()) {
-      has_been_modified = ModifyGraph(graph, node_index_to_its_order_in_topological_sort_map,
-                                      candidate_output_args_map, logger,
+      has_been_modified = ModifyGraph(graph,
+                                      node_index_to_its_order_in_topological_sort_map,
+                                      logger,
                                       yield_op_order_in_topological_sort,
                                       p_node,
                                       node_to_opt_plan_map[p_node],
@@ -255,6 +277,135 @@ Status MemoryOptimizer::ApplyImpl(Graph& graph, bool& modified, int /*graph_leve
   }
 
   PrintSummary(memory_opt_planner, node_to_apply_context_map, logger);
+
+  if (modified) {
+    ORT_ENFORCE(graph.Resolve().IsOK());
+  }
+
+  auto is_recompute_node = [](const Node* n) {
+    std::string_view name1 = n->Name();
+    constexpr std::string_view recompute_suffix = "_recompute";
+    if (name1.size() < recompute_suffix.size()) {
+      return false;
+    }
+
+    return name1.compare(name1.size() - recompute_suffix.size(), recompute_suffix.size(), recompute_suffix) == 0;
+  };
+
+  // for (const auto& n1 : graph.Nodes()) {
+  //   name_to_node_map1.insert({n1.Name(), &n1});
+  // }
+
+  // for (const auto& n1 : graph.Nodes()) {
+  //   // Check whether node name ends with "_recompute"
+  //   if (ends_with(n1.Name(), recompute_suffix)) {
+  //     auto name1_without_recompute = n1.Name().substr(0, n1.Name().size() - recompute_suffix.size());
+  //     fw_name_to_node_map.insert({name1_without_recompute, name_to_node_map1.at(name1_without_recompute)});
+  //     // bw_name_to_node_map.insert({n1.Name(), std::make_pair<const Node*, float>(name_to_node_map1.at(name1_without_recompute), 0.0f)});
+  //     bw_recompute_to_fw_node_map.insert({n1.Name(), name1_without_recompute});
+  //   }
+  // }
+
+  // Loop through all the nodes in the graph and find the recompute nodes, categorize them into two groups:
+  // group 1: recompute nodes that are used only by other non-recompute nodes.
+  // group 2: recompute nodes that are used by some(>=0) non-recompute nodes and some(>=1) recompute nodes
+  InlinedHashMap<const Node*, InlinedVector<const Node*>> group1_recompute_nodes;
+  InlinedHashMap<const Node*, std::pair<InlinedVector<const Node*>, InlinedVector<const Node*>>> group2_recompute_nodes;
+  InlinedHashMap<const Node*, ptrdiff_t> recompute_node_to_its_critical_path_node_order_map;
+  for (const auto& n1 : graph.Nodes()) {
+    if (is_recompute_node(&n1)) {
+      InlinedVector<const Node*> non_recompute_consumers;
+      InlinedVector<const Node*> recompute_consumers;
+      for (auto o_iter = n1.OutputEdgesBegin(); o_iter != n1.OutputEdgesEnd(); ++o_iter) {
+        const auto& output = *o_iter;
+        const Node* consumer = graph.GetNode(output.GetNode().Index());
+        if (is_recompute_node(consumer)) {
+          recompute_consumers.push_back(consumer);
+        } else {
+          non_recompute_consumers.push_back(consumer);
+        }
+      }
+
+      if (recompute_consumers.empty()) {
+        group1_recompute_nodes.insert({&n1, non_recompute_consumers});
+      } else {
+        std::cout << ">>>22222Recompute node: " << n1.Name() << " non_recompute_consumers: " << non_recompute_consumers.size() << " recompute_consumers: " << recompute_consumers.size() << std::endl;
+        group2_recompute_nodes.insert({&n1, {non_recompute_consumers, recompute_consumers}});
+      }
+    }
+  }
+
+  // Loop group1_recompute_nodes, get the minimal value of execution order from node_index_to_its_order_in_topological_sort_map for its output nodes.
+  for (const auto& [non_recompute_node, non_recompute_consumers] : group1_recompute_nodes) {
+    ptrdiff_t min_order = std::numeric_limits<ptrdiff_t>::max();
+    for (const auto& consumer : non_recompute_consumers) {
+      auto it = node_index_to_its_order_in_topological_sort_map.find(consumer->Index());
+      if (it != node_index_to_its_order_in_topological_sort_map.end()) {
+        std::cout << ">>>Find oder for consumer node: " << consumer->Name() << " order: " << it->second << std::endl;
+        min_order = std::min(min_order, it->second);
+      }
+    }
+
+    std::cout << ">>>Recompute node: " << non_recompute_node->Name() << " min_order: " << min_order << std::endl;
+
+    recompute_node_to_its_critical_path_node_order_map.insert({non_recompute_node, min_order});
+  }
+
+  // Then at this point, all "boudary" recompute nodes are marked for its critical path node order.
+  // Next, loop group2_recompute_nodes, 1). for each recompute node's non-recompute consumers, find the minimal value of
+  // execution order from node_index_to_its_order_in_topological_sort_map; 2). for each recompute node's recompute consumers,
+  // find the minimal value of execution order from recompute_node_to_its_critical_path_node_order_map.
+  // Loop the node in reversed topological order.
+  GraphViewer updated_graph_viewer(graph);
+  const auto& updated_node_ids = updated_graph_viewer.GetNodesInTopologicalOrder(ExecutionOrder::PRIORITY_BASED);
+  for (int i = static_cast<int>(updated_node_ids.size()) - 1; i >= 0; --i) {
+    Node* p_node = graph.GetNode(updated_node_ids[i]);
+
+    if (p_node == nullptr) {
+      continue;
+    }
+
+    if (group2_recompute_nodes.find(p_node) != group2_recompute_nodes.end()) {
+      const auto& [non_recompute_consumers, recompute_consumers] = group2_recompute_nodes.at(p_node);
+      ptrdiff_t min_order = std::numeric_limits<ptrdiff_t>::max();
+      for (const auto& consumer : non_recompute_consumers) {
+        auto it = node_index_to_its_order_in_topological_sort_map.find(consumer->Index());
+        ORT_ENFORCE(it != node_index_to_its_order_in_topological_sort_map.end(), "Cannot find the order for non-recompute consumer node: ", consumer->Name());
+        min_order = std::min(min_order, it->second);
+      }
+
+      for (const auto& consumer : recompute_consumers) {
+        auto it = recompute_node_to_its_critical_path_node_order_map.find(consumer);
+        ORT_ENFORCE(it != recompute_node_to_its_critical_path_node_order_map.end(), "Cannot find the critical path order for recompute node: ", consumer->Name());
+        min_order = std::min(min_order, it->second);
+      }
+
+      std::cout << ">>>PPRecompute node: " << p_node->Name() << " min_order: " << min_order << std::endl;
+
+      recompute_node_to_its_critical_path_node_order_map.insert({p_node, min_order});
+    }
+  }
+
+  // Finally, loop through recompute_node_to_its_critical_path_node_order_map, add attribute "__critical_execution_order"
+  // for each recompute node, which will be used for priority based graph ordering.
+  for (const auto& [recompute_node, order] : recompute_node_to_its_critical_path_node_order_map) {
+    Node* mutable_node = graph.GetNode(recompute_node->Index());
+    mutable_node->AddAttribute("__critical_execution_order", static_cast<int64_t>(order));
+    modified = true;
+  }
+
+  // sort the recompute nodes based on the critical path order and print to stdout
+  std::vector<std::pair<std::string, ptrdiff_t>> recompute_nodes_sorted_by_critical_path_order;
+  for (const auto& [recompute_node, order] : recompute_node_to_its_critical_path_node_order_map) {
+    recompute_nodes_sorted_by_critical_path_order.push_back({recompute_node->Name(), order});
+  }
+  std::sort(recompute_nodes_sorted_by_critical_path_order.begin(), recompute_nodes_sorted_by_critical_path_order.end(),
+            [](const std::pair<std::string, ptrdiff_t>& a, const std::pair<std::string, ptrdiff_t>& b) {
+              return a.second < b.second;
+            });
+  for (const auto& [recompute_node_name, order] : recompute_nodes_sorted_by_critical_path_order) {
+    std::cout << ">>>" << order << "Recompute node: " << recompute_node_name << std::endl;
+  }
 
   return Status::OK();
 }
@@ -338,7 +489,7 @@ Status MemoryOptimizer::CreateRecomputeGraph(Graph& graph,
       graph.UpdateProducerNode(recompute_node.MutableOutputDefs()[j]->Name(), recompute_node.Index());
     }
 
-    // Add the edges from the recompute node to the original node.
+    // Add the edges from the recompute node to its input nodes, making sure consumers/producers are updated.
     for (size_t j = 0; j < recompute_node.MutableInputDefs().size(); ++j) {
       NodeArg* input_arg = recompute_node.MutableInputDefs()[j];
       const Node* producer_node = graph.GetProducerNode(input_arg->Name());

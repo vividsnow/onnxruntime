@@ -1837,10 +1837,20 @@ struct VisitorPriorityQueue {
 
 #if !defined(ORT_MINIMAL_BUILD)
 void Graph::KahnsTopologicalSort(const std::function<void(const Node*)>& enter,
-                                 const std::function<bool(const Node*, const Node*)>& comp) const {
+                                 const std::function<bool(const Node*, const Node*)>& comp,
+                                 InlinedHashMap<std::string, float>& node_name_to_timestamp_map) const {
   InlinedVector<size_t> in_degree(MaxNodeIndex(), 0);
   InlinedVector<NodeIndex> topo_order;
+
   VisitorPriorityQueue<const Node*> to_visit(comp);
+
+  auto get_time_stamp = []() -> float {
+    auto now = std::chrono::high_resolution_clock::now();
+    auto duration = now.time_since_epoch();
+    // Convert to floating point seconds
+    float timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count() / 1.0f;
+    return timestamp;
+  };
 
   auto number_of_nodes = NumberOfNodes();
   topo_order.reserve(number_of_nodes);
@@ -1849,13 +1859,19 @@ void Graph::KahnsTopologicalSort(const std::function<void(const Node*)>& enter,
     size_t input_edge_count = node.GetInputEdgesCount();
     in_degree[node.Index()] = input_edge_count;
     if (input_edge_count == 0) {
+      // do this before push (ordering is important for the priority queue)
+      if (node_name_to_timestamp_map.count(node.Name()) == 0) {
+        node_name_to_timestamp_map[node.Name()] = get_time_stamp();
+      }
       to_visit.push(&node);
     }
   }
 
   while (!to_visit.empty()) {
-    const Node* current = to_visit.top();
+    auto last_work_item = to_visit.top();
     to_visit.pop();
+
+    const Node* current = last_work_item;
 
     if (!current) continue;
 
@@ -1868,6 +1884,9 @@ void Graph::KahnsTopologicalSort(const std::function<void(const Node*)>& enter,
       node_in_degree--;
 
       if (node_in_degree == 0) {
+        if (node_name_to_timestamp_map.count(node_it->Name()) == 0) {
+          node_name_to_timestamp_map[node_it->Name()] = get_time_stamp();
+        }
         to_visit.push(&*node_it);
       }
     }

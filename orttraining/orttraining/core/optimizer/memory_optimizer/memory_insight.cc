@@ -13,6 +13,7 @@
 #include "core/framework/random_seed.h"
 #include "core/graph/graph_utils.h"
 #include "core/graph/graph_viewer.h"
+#include "core/optimizer/utils.h"
 #include "orttraining/core/optimizer/memory_optimizer/common.h"
 #include "orttraining/core/optimizer/memory_optimizer/optimization_planner.h"
 #include "orttraining/core/optimizer/memory_optimizer/recompute_analysis.h"
@@ -217,51 +218,17 @@ Status ResetNodeBackwardPassAttribute(Graph& graph, bool& modified) {
   return Status::OK();
 }
 
-Status FindORTModuleMemoryOpportunity(const GraphViewer& graph_viewer,
-                                      const ProbeConfig& probe_config,
-                                      const logging::Logger& logger,
-                                      InlinedHashMap<NodeIndex, ptrdiff_t>&
-                                          node_index_to_its_order_in_topological_sort_map,
-                                      ptrdiff_t& yield_op_order_in_topological_sort,
-                                      InlinedHashMap<const Node*, InlinedVector<size_t>>&
-                                          candidate_output_args_map,
-                                      MemoryOptimizationPlanner& memory_opt_planner) {
+Status FindSelectiveRecomputeOpportunity(const GraphViewer& graph_viewer,
+                                         const ProbeConfig& probe_config,
+                                         const ActivationUsedMap& fw_op_output_arg_used_map,
+                                         const InlinedHashMap<NodeIndex, ptrdiff_t>&
+                                             node_index_to_its_order_in_topological_sort_map,
+                                         const InlinedHashMap<const Node*, InlinedVector<size_t>>&
+                                             candidate_output_args_map,
+                                         const InlinedVector<const Node*>& layer_boundary_ln_nodes,
+                                         const logging::Logger& logger,
+                                         MemoryOptimizationPlanner& memory_opt_planner) {
   const auto& node_ids = graph_viewer.GetNodesInTopologicalOrder(ExecutionOrder::PRIORITY_BASED);
-
-  // Find boundary ops between forward and backward pass, currently, it's limited to YieldOp.
-  yield_op_order_in_topological_sort = -1;
-  for (size_t i = 0; i < node_ids.size(); ++i) {
-    const Node* p_node = graph_viewer.GetNode(node_ids[i]);
-    if (p_node == nullptr) { /* skip removed nodes*/
-      continue;
-    }
-
-    if (p_node->OpType() == "YieldOp") {
-      if (yield_op_order_in_topological_sort != -1) {
-        return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "There are multiple YieldOps in the graph, node: ",
-                               p_node->Name(), " is the second one.");
-      }
-      yield_op_order_in_topological_sort = static_cast<ptrdiff_t>(i);
-    }
-
-    node_index_to_its_order_in_topological_sort_map[p_node->Index()] = static_cast<ptrdiff_t>(i);
-  }
-
-  ActivationUsedMap fw_op_output_arg_used_map;
-
-  InlinedHashMap<const Node*, bool> is_forward_nodes;
-  ORT_RETURN_IF_ERROR(GetStashedActivationCandidates(graph_viewer,
-                                                     yield_op_order_in_topological_sort,
-                                                     fw_op_output_arg_used_map,
-                                                     candidate_output_args_map,
-                                                     is_forward_nodes,
-                                                     logger));
-
-  InlinedHashSet<const Node*> layer_boundary_ln_nodes;
-  FindLayerBoundaryLayerNormNodes(graph_viewer, logger, node_index_to_its_order_in_topological_sort_map,
-                                  yield_op_order_in_topological_sort, layer_boundary_ln_nodes);
-
-  // The first pass - find the candidate subgraphs.
   for (int i = static_cast<int>(node_ids.size()) - 1; i >= 0; --i) {
     const Node* p_node = graph_viewer.GetNode(node_ids[i]);
     if (p_node == nullptr) {
@@ -306,6 +273,380 @@ Status FindORTModuleMemoryOpportunity(const GraphViewer& graph_viewer,
       }
     }
   }
+
+  return Status::OK();
+}
+
+// void PPNodesInTopoOrderToString(gsl::span<const Node* const> nodes_in_topological_order,
+//                                 std::string& subgraph_string_representation,
+//                                 std::string& log_info) {
+//   std::ostringstream oss;
+//   std::ostringstream subgraph_string_representation_oss;
+//   size_t node_count = nodes_in_topological_order.size();
+//   for (size_t i = 0; i < node_count; ++i) {
+//     if (i < node_count - 1) {  // Ignore the last node.
+//       oss << "(name:" << nodes_in_topological_order[i]->Name() << ", type:" << nodes_in_topological_order[i]->OpType()
+//           << "),";
+//     }
+
+//     subgraph_string_representation_oss << nodes_in_topological_order[i]->OpType() << "+";
+//   }
+
+//   subgraph_string_representation = subgraph_string_representation_oss.str();
+//   log_info = oss.str();
+//   if (log_info.size() > 0) {
+//     log_info = " with its precedent nodes: " + log_info;
+//   }
+// }
+
+Status FindStrictLayerwiseRecomputeOpportunity(const GraphViewer& graph_viewer,
+                                               const InlinedHashMap<NodeIndex, ptrdiff_t>&
+                                                   node_index_to_its_order_in_topological_sort_map,
+                                               const InlinedVector<const Node*>& layer_boundary_ln_nodes,
+                                               InlinedHashMap<const Node*, bool>& is_forward_nodes,
+                                               MemoryOptimizationPlanner& memory_opt_planner) {
+  // Re-roder the layer boundary nodes in topological order.
+  // std::cout << "FindStrictLayerwiseRecomputeOpportunity based detected " << layer_boundary_ln_nodes.size() << " boudary node " << std::endl;
+  for (size_t index = 1; index < layer_boundary_ln_nodes.size(); ++index) {
+    InlinedVector<const Node*> reachable_nodes;
+    const Node* end_node_input_node;
+    int32_t output_index = 0;
+    // std::cout << "Looking for layer - start from node " << layer_boundary_ln_nodes[index - 1]->Name() << std::endl;
+    ORT_RETURN_IF_ERROR(FindReachableNodesFromGivenInputAndOutput(graph_viewer,
+                                                                  layer_boundary_ln_nodes[index - 1],
+                                                                  layer_boundary_ln_nodes[index],
+                                                                  reachable_nodes,
+                                                                  end_node_input_node, output_index));
+    if (reachable_nodes.size() > 0) {
+      ORT_ENFORCE(end_node_input_node != nullptr, "The end node input node should not be null");
+      std::cout << "Found layer - start from node " << layer_boundary_ln_nodes[index - 1]->Name() << " to node "
+                << end_node_input_node->Name() << ", subgraph contains " << reachable_nodes.size() << " nodes" << std::endl;
+      // Check the input node of layer_boundary_ln_nodes[index] is PythonOp with its func_name to be
+      // "onnxruntime.training.utils.hooks._zero_offload_subscriber.ORTZeROOffloadPreForwardFunction".
+      // The whole layer should start with PreForwardFunction and end with PostForwardFunction.
+      const NodeArg* start_node_input_node_arg = layer_boundary_ln_nodes[index - 1]->InputDefs()[0];
+      const Node* start_node_input_node = graph_viewer.GetProducerNode(start_node_input_node_arg->Name());
+      //
+      //  Check whether stage3 related PythonOp nodes are inserted before and after each module forward run.
+      //  One classical layer includes 1). input layer norm, 2). attention, 3). residual add (input layer norm input + attention output),
+      //  4). post attention layer norm feedforward, and 5). residual add (post attention layer norm input + feedforward out).
+      //
+      //  The pattern graph looks like below for each transformer layer (taking the example of MistralDecoderLayer):
+      //           PythonOp(deepspeed.runtime.zero.parameter_offload.PostBackwardFunction) - Embedding
+      //                          |
+      //           PythonOp(onnxruntime.training.utils.hooks._zero_offload_subscriber.ORTZeROOffloadPreForwardFunction) - Embedding
+      //                          |
+      //                       Embedding
+      //                          |
+      //           PythonOp(onnxruntime.training.utils.hooks._zero_offload_subscriber.ORTZeROOffloadPostForwardFunction) - Embedding
+      //                          |
+      //           PythonOp(deepspeed.runtime.zero.parameter_offload.PreBackwardFunction) - Embedding
+      //                          |
+      //                      (real layer boudary)
+      //                          |
+      //           PythonOp(deepspeed.runtime.zero.parameter_offload.PostBackwardFunction) - MistralDecoderLayer
+      //                          |
+      //           PythonOp(onnxruntime.training.utils.hooks._zero_offload_subscriber.ORTZeROOffloadPreForwardFunction) - MistralDecoderLayer
+      //                          |
+      //     ---------------------|
+      //     |                    |
+      //     |             PythonOp(deepspeed.runtime.zero.parameter_offload.PostBackwardFunction) - SimplifiedLayerNormalization
+      //     |                                   |
+      //     |             PythonOp(onnxruntime.training.utils.hooks._zero_offload_subscriber.ORTZeROOffloadPreForwardFunction) - SimplifiedLayerNormalization
+      //     |                                   |
+      //     |                           SimplifiedLayerNormalization (layer boudary node S we found eariler)
+      //     |                                   |
+      //     |             PythonOp(onnxruntime.training.utils.hooks._zero_offload_subscriber.ORTZeROOffloadPostForwardFunction) - SimplifiedLayerNormalization
+      //     |                                   |
+      //     |             PythonOp(deepspeed.runtime.zero.parameter_offload.PreBackwardFunction) - SimplifiedLayerNormalization
+      //     |                                   |
+      //     |             PythonOp(deepspeed.runtime.zero.parameter_offload.PostBackwardFunction) - MistralAttention (not found, why??????)
+      //     |                                   |
+      //     |             PythonOp(onnxruntime.training.utils.hooks._zero_offload_subscriber.ORTZeROOffloadPreForwardFunction) - MistralAttention
+      //     |                                   |
+      //     |                           MistralAttention
+      //     |                                   |
+      //     |             PythonOp(onnxruntime.training.utils.hooks._zero_offload_subscriber.ORTZeROOffloadPostForwardFunction) - MistralAttention
+      //     |                                   |
+      //     |             PythonOp(deepspeed.runtime.zero.parameter_offload.PreBackwardFunction) - MistralAttention
+      //     |                                 ... (similar case for other inner modules including linear, dropout, etc.)
+      //     |                                   |
+      //     |__________________________________Add
+      //                                         |
+      //     ------------------------------------|
+      //     |                                   |
+      //     |             PythonOp(deepspeed.runtime.zero.parameter_offload.PostBackwardFunction) - SimplifiedLayerNormalization
+      //     |                                   |
+      //     |             PythonOp(onnxruntime.training.utils.hooks._zero_offload_subscriber.ORTZeROOffloadPreForwardFunction) - SimplifiedLayerNormalization
+      //     |                                   |
+      //     |                           SimplifiedLayerNormalization
+      //     |                                   |
+      //     |             PythonOp(onnxruntime.training.utils.hooks._zero_offload_subscriber.ORTZeROOffloadPostForwardFunction) - SimplifiedLayerNormalization
+      //     |                                   |
+      //     |             PythonOp(deepspeed.runtime.zero.parameter_offload.PreBackwardFunction) - SimplifiedLayerNormalization
+      //     |                                   |
+      //     |                         ... (similar case feedforward)
+      //     |                                   |
+      //     |__________________________________Add
+      //                                         |
+      //           PythonOp(onnxruntime.training.utils.hooks._zero_offload_subscriber.ORTZeROOffloadPostForwardFunction) - MistralDecoderLayer
+      //                                        |
+      //           PythonOp(deepspeed.runtime.zero.parameter_offload.PreBackwardFunction) - MistralDecoderLayer
+      //                                        |
+      //                         (Another new layer)
+      //                      (real layer boudary)
+      //                          |
+      //           PythonOp(deepspeed.runtime.zero.parameter_offload.PostBackwardFunction) - MistralDecoderLayer
+      //                          |
+      //           PythonOp(onnxruntime.training.utils.hooks._zero_offload_subscriber.ORTZeROOffloadPreForwardFunction) - MistralDecoderLayer
+      //                          |
+      //     ---------------------|
+      //     |                    |
+      //     |             PythonOp(deepspeed.runtime.zero.parameter_offload.PostBackwardFunction) - SimplifiedLayerNormalization
+      //     |                                   |
+      //     |             PythonOp(onnxruntime.training.utils.hooks._zero_offload_subscriber.ORTZeROOffloadPreForwardFunction) - SimplifiedLayerNormalization
+      //     |                                   |
+      //     |                           SimplifiedLayerNormalization (layer boudary node E we found earlier)
+      //                                 ....
+      //
+      // Be noted: we need shift a bit around the layer boundary node S and E, as the layer boundary node S and E are not the real boundary nodes now.
+      // Specifically, we shift two nodes (PostBackwardFunction and ORTZeROOffloadPreForwardFunction) before S and E as the real boundary nodes.
+
+      auto is_preforward_function = [](const Node* node) -> bool {
+        return node->OpType() == "PythonOp" &&
+               node->Domain() == kMSDomain &&
+               node->GetAttributes().count("func_name") &&
+               node->GetAttributes().at("func_name").s() ==
+                   "onnxruntime.training.utils.hooks._zero_offload_subscriber.ORTZeROOffloadPreForwardFunction";
+      };
+
+      auto is_postbackward_function = [](const Node* node) -> bool {
+        return node->OpType() == "PythonOp" &&
+               node->Domain() == kMSDomain &&
+               node->GetAttributes().count("func_name") &&
+               node->GetAttributes().at("func_name").s() ==
+                   "deepspeed.runtime.zero.parameter_offload.PostBackwardFunction";
+      };
+
+      bool stage_pattern_match = true;
+      InlinedVector<const Node*> nodes_to_append;
+      InlinedVector<const Node*> nodes_to_remove;
+      if (start_node_input_node != nullptr && is_preforward_function(start_node_input_node) &&
+          end_node_input_node != nullptr && is_preforward_function(end_node_input_node)) {
+        nodes_to_append.push_back(start_node_input_node);
+
+        const Node* updated_start_node_input_node = graph_viewer.GetProducerNode(start_node_input_node->InputDefs()[0]->Name());
+        if (updated_start_node_input_node != nullptr && is_postbackward_function(updated_start_node_input_node)) {
+          // std::cout << "Update the start node input node to " << updated_start_node_input_node->Name() << std::endl;
+          nodes_to_append.push_back(updated_start_node_input_node);
+
+          updated_start_node_input_node = graph_viewer.GetProducerNode(updated_start_node_input_node->InputDefs()[0]->Name());
+          if (updated_start_node_input_node != nullptr && is_preforward_function(updated_start_node_input_node)) {
+            // std::cout << "Update the start node input node to " << updated_start_node_input_node->Name() << std::endl;
+            nodes_to_append.push_back(updated_start_node_input_node);
+
+            updated_start_node_input_node = graph_viewer.GetProducerNode(updated_start_node_input_node->InputDefs()[0]->Name());
+            if (updated_start_node_input_node != nullptr && is_postbackward_function(updated_start_node_input_node)) {
+              std::cout << "Update the start node input node to " << updated_start_node_input_node->Name() << std::endl;
+              nodes_to_append.push_back(updated_start_node_input_node);
+            } else {
+              stage_pattern_match = false;
+            }
+
+          } else {
+            stage_pattern_match = false;
+          }
+
+        } else {
+          stage_pattern_match = false;
+        }
+
+        // reachable_nodes.erase(std::remove(reachable_nodes.begin(), reachable_nodes.end(), end_node_input_node), reachable_nodes.end());
+        nodes_to_remove.push_back(end_node_input_node);
+        const Node* updated_end_node_input_node = graph_viewer.GetProducerNode(end_node_input_node->InputDefs()[0]->Name());
+        if (updated_end_node_input_node != nullptr && is_postbackward_function(updated_end_node_input_node)) {
+          // updated_end_node_input_node = graph_viewer.GetProducerNode(updated_end_node_input_node->InputDefs()[0]->Name());
+          nodes_to_remove.push_back(updated_end_node_input_node);
+          std::cout << "Update the end node input node to " << updated_end_node_input_node->Name() << std::endl;
+        } else {
+          stage_pattern_match = false;
+        }
+        // std::cout << "Append PreForwardFunction (" << start_node_input_node->Name() << ") to the subgraph, subgraph contains " << reachable_nodes.size() << " nodes" << std::endl;
+      } else {
+        stage_pattern_match = false;
+      }
+
+      if (stage_pattern_match) {
+        ORT_ENFORCE(nodes_to_append.size() == 4, "The number of nodes to append should be 4");
+        ORT_ENFORCE(nodes_to_remove.size() == 2, "The number of nodes to remove should be 2");
+        for (size_t i = 0; i < nodes_to_append.size(); ++i) {
+          reachable_nodes.push_back(nodes_to_append[i]);
+        }
+        // remove the nodes to remove from reachable_nodes.
+        for (size_t i = 0; i < nodes_to_remove.size(); ++i) {
+          reachable_nodes.erase(std::remove(reachable_nodes.begin(), reachable_nodes.end(), nodes_to_remove[i]), reachable_nodes.end());
+        }
+        std::cout << "Find Stage3 recomputable pattern" << std::endl;
+      } else {
+        std::cout << "Not find Stage3 recomputable pattern" << std::endl;
+
+        // TODO(pengwa): remove the unnecessary nodes in reachable_nodes, which will not be used in backward nodes.
+
+        SortNodesInTopoOrder(node_index_to_its_order_in_topological_sort_map, reachable_nodes);
+        bool has_node_dropped = false;
+        do {
+          has_node_dropped = false;
+          // Loop reachable nodes in reverse topo order, and remove the nodes which are not used by backward nodes.
+          // If found one, set has_node_dropped to true, break from the loop.
+          for (int index = static_cast<int>(reachable_nodes.size()) - 1; index >= 0; --index) {
+            const Node* node = reachable_nodes[index];
+
+            bool used_by_bw_nodes = false;
+            for (auto it = node->OutputEdgesBegin(); it != node->OutputEdgesEnd(); ++it) {
+              const Node& consumer_node = it->GetNode();
+              if (is_forward_nodes.count(&consumer_node) == 0 || is_forward_nodes.at(&consumer_node)) {
+                used_by_bw_nodes = true;
+                break;
+              }
+            }
+
+            if (!used_by_bw_nodes) {
+              std::cout << "Remove node " << node->Name() << " from the subgraph" << std::endl;
+              reachable_nodes.erase(reachable_nodes.begin() + index);
+              has_node_dropped = true;
+              break;
+            }
+          }
+
+        } while (has_node_dropped);
+
+        // std::string subgraph_string_representation, log_info;
+
+        // PPNodesInTopoOrderToString(reachable_nodes, subgraph_string_representation, log_info);
+        // std::cout << "Sorted subgraph: " << subgraph_string_representation << ", details: " << reachable_nodes.size() << std::endl;
+        // for (const Node* node : reachable_nodes) {
+        //   std::cout << "Node: " << node->Name() << ", op type: " << node->OpType() << ", node index: " << node_index_to_its_order_in_topological_sort_map.at(node->Index()) << std::endl;
+        // }
+        InlinedVector<size_t> output_indices{static_cast<size_t>(output_index)};
+        std::unique_ptr<NodeRecomputePlan> plan = std::make_unique<NodeRecomputePlan>(end_node_input_node,
+                                                                                      output_indices,
+                                                                                      reachable_nodes,
+                                                                                      false /*compromise_stashed_activation*/,
+                                                                                      static_cast<float>(1.0f) /*save_ratio*/);
+
+        memory_opt_planner.AddNodeOptimizationPlan(end_node_input_node, std::move(plan));
+      }
+    }
+  }
+
+  return Status::OK();
+}
+
+Status FindORTModuleMemoryOpportunity(const GraphViewer& graph_viewer,
+                                      const ProbeConfig& probe_config,
+                                      const logging::Logger& logger,
+                                      InlinedHashMap<NodeIndex, ptrdiff_t>&
+                                          node_index_to_its_order_in_topological_sort_map,
+                                      ptrdiff_t& yield_op_order_in_topological_sort,
+                                      InlinedHashMap<const Node*, InlinedVector<size_t>>&
+                                          candidate_output_args_map,
+                                      MemoryOptimizationPlanner& memory_opt_planner) {
+  const auto& node_ids = graph_viewer.GetNodesInTopologicalOrder(ExecutionOrder::PRIORITY_BASED);
+
+  // Find boundary ops between forward and backward pass, currently, it's limited to YieldOp.
+  yield_op_order_in_topological_sort = -1;
+  for (size_t i = 0; i < node_ids.size(); ++i) {
+    const Node* p_node = graph_viewer.GetNode(node_ids[i]);
+    if (p_node == nullptr) { /* skip removed nodes*/
+      continue;
+    }
+
+    if (p_node->OpType() == "YieldOp") {
+      if (yield_op_order_in_topological_sort != -1) {
+        return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "There are multiple YieldOps in the graph, node: ",
+                               p_node->Name(), " is the second one.");
+      }
+      yield_op_order_in_topological_sort = static_cast<ptrdiff_t>(i);
+    }
+
+    node_index_to_its_order_in_topological_sort_map[p_node->Index()] = static_cast<ptrdiff_t>(i);
+  }
+
+  ActivationUsedMap fw_op_output_arg_used_map;
+
+  InlinedHashMap<const Node*, bool> is_forward_nodes;
+  ORT_RETURN_IF_ERROR(GetStashedActivationCandidates(graph_viewer,
+                                                     yield_op_order_in_topological_sort,
+                                                     fw_op_output_arg_used_map,
+                                                     candidate_output_args_map,
+                                                     is_forward_nodes,
+                                                     logger));
+
+  InlinedVector<const Node*> layer_boundary_ln_nodes;
+  FindLayerBoundaryLayerNormNodes(graph_viewer, logger, node_index_to_its_order_in_topological_sort_map,
+                                  yield_op_order_in_topological_sort, layer_boundary_ln_nodes);
+
+  // The first pass - find the candidate subgraphs.
+  if (probe_config.enable_strict_layerwise_mode) {
+    ORT_RETURN_IF_ERROR(FindStrictLayerwiseRecomputeOpportunity(graph_viewer,
+                                                                node_index_to_its_order_in_topological_sort_map,
+                                                                layer_boundary_ln_nodes,
+                                                                is_forward_nodes,
+                                                                memory_opt_planner));
+  } else {
+    ORT_RETURN_IF_ERROR(FindSelectiveRecomputeOpportunity(graph_viewer,
+                                                          probe_config,
+                                                          fw_op_output_arg_used_map,
+                                                          node_index_to_its_order_in_topological_sort_map,
+                                                          candidate_output_args_map,
+                                                          layer_boundary_ln_nodes,
+                                                          logger,
+                                                          memory_opt_planner));
+  }
+  // for (int i = static_cast<int>(node_ids.size()) - 1; i >= 0; --i) {
+  //   const Node* p_node = graph_viewer.GetNode(node_ids[i]);
+  //   if (p_node == nullptr) {
+  //     continue;
+  //   }
+
+  //   if (candidate_output_args_map.find(p_node) == candidate_output_args_map.end()) {
+  //     continue;
+  //   }
+
+  //   bool can_compromise_stashed_activation = false;
+  //   std::unique_ptr<NodeRecomputePlan> recompute_plan =
+  //       CheckNodeForRecompute(graph_viewer,
+  //                             *p_node,
+  //                             probe_config,
+  //                             fw_op_output_arg_used_map,
+  //                             node_index_to_its_order_in_topological_sort_map,
+  //                             candidate_output_args_map,
+  //                             layer_boundary_ln_nodes,
+  //                             logger, false,
+  //                             can_compromise_stashed_activation);
+  //   if (recompute_plan != nullptr) {
+  //     memory_opt_planner.AddNodeOptimizationPlan(p_node, std::move(recompute_plan));
+  //   }
+
+  //   // Only detect compromise recompute when recompute is not found, in case there are multiple recompute plans
+  //   // for the same named activations, then user might enable those conflicting recompute plans by mistakes.
+  //   if (recompute_plan == nullptr && can_compromise_stashed_activation) {
+  //     MO_LOG_DEBUG_INFO(logger, "Searching Node " + p_node->Name() + "(" + p_node->OpType() +
+  //                                   ") for compromised recompute");
+  //     // If the subgraph recompute can save memory by comprising the assumption - recompute graphs' input must exist
+  //     // during backward pass, then we can consider to recompute them.
+  //     std::unique_ptr<NodeRecomputePlan> recompute_with_compromise_plan =
+  //         CheckNodeForRecompute(graph_viewer, *p_node, probe_config, fw_op_output_arg_used_map,
+  //                               node_index_to_its_order_in_topological_sort_map,
+  //                               candidate_output_args_map,
+  //                               layer_boundary_ln_nodes,
+  //                               logger, true,
+  //                               can_compromise_stashed_activation);
+  //     if (recompute_with_compromise_plan != nullptr) {
+  //       memory_opt_planner.AddNodeOptimizationPlan(p_node, std::move(recompute_with_compromise_plan));
+  //     }
+  //   }
+  // }
 
   return Status::OK();
 }

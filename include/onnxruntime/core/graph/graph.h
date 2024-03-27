@@ -1077,13 +1077,18 @@ class Graph {  // NOLINT(clang-analyzer-optin.performance.Padding): preserve exi
                       const std::function<bool(const Node*, const Node*)>& comp,
                       const std::function<bool(const Node*, const Node*)>& stop) const;
 
+  // void PriorityBasedReverseDFSFrom(gsl::span<const Node* const> from,
+  //                                  const std::function<void(const Node*)>& enter,
+  //                                  const std::function<bool(const Node*, const Node*)>& comp) const;
+
 #if !defined(ORT_MINIMAL_BUILD)
   /** Performs topological sort with Kahn's algorithm on the graph/s.
   @param enter Visit function that will be invoked on a node when it is visited.
   @param comp Comparison function to stabilize the traversal order by making Node ordering deterministic.
   */
   void KahnsTopologicalSort(const std::function<void(const Node*)>& enter,
-                            const std::function<bool(const Node*, const Node*)>& comp) const;
+                            const std::function<bool(const Node*, const Node*)>& comp,
+                            InlinedHashMap<std::string, float>& node_name_to_timestamp_map) const;
 
 #endif
 

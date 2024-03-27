@@ -19,6 +19,10 @@ struct NodeCompare {
   bool operator()(const Node* n1, const Node* n2) const;
 };
 
+// struct PriorityNodeCompareFunc {
+//   bool operator()(const Node* n1, const Node* n2) const;
+// };
+
 /**
 @class GraphViewer
 Class that provides a read-only view of the Graph.

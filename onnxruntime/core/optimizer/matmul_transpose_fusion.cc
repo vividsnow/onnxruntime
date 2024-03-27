@@ -385,7 +385,7 @@ Status MatmulTransposeFusion::ApplyImpl(Graph& graph, bool& modified, int graph_
     const std::array input_defs{left_input, right_input};
     const std::array output_defs{node.MutableOutputDefs()[0]};
 
-    Node& matmul_node = graph.AddNode(graph.GenerateNodeName("MatMul_With_Transpose"),
+    Node& matmul_node = graph.AddNode(graph.GenerateNodeName(node.Name() + "/fused"),
                                       "FusedMatMul",
                                       "fused MatMul and Transpose ",
                                       input_defs,

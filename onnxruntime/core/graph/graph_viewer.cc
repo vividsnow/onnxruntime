@@ -12,6 +12,14 @@ bool NodeCompare::operator()(const Node* n1, const Node* n2) const {
 
 #if !defined(ORT_MINIMAL_BUILD)
 struct PriorityNodeCompare {
+  PriorityNodeCompare(
+      const InlinedHashMap<std::string, const Node*>& fw_name_to_node_map,
+      const InlinedHashMap<std::string, std::string>& bw_recompute_to_fw_node_map,
+      const InlinedHashMap<std::string, float>& node_name_to_timestamp_map)
+      : fw_name_to_node_map_(fw_name_to_node_map),
+        bw_recompute_to_fw_node_map_(bw_recompute_to_fw_node_map),
+        node_name_to_timestamp_map_(node_name_to_timestamp_map) {}
+
   inline bool IsHighPri(const Node* n) const {
     // local statics so we can compare std::strings in the checks
     static constexpr std::string_view shape_op("Shape");
@@ -40,21 +48,53 @@ struct PriorityNodeCompare {
     }
 
 #ifdef ENABLE_TRAINING
+    const std::string __critical_execution_order = "__critical_execution_order";
     // nodes of forward pass will be output first
     auto n1_attrs = n1->GetAttributes();
     auto n2_attrs = n2->GetAttributes();
-    int64_t n1_is_forward = static_cast<int64_t>(n1_attrs.find(kBackwardNodeAttributeName) == n1_attrs.cend()) ||
-                            (n1_attrs.at(kBackwardNodeAttributeName).i() + 1) % 2;
-    int64_t n2_is_forward = static_cast<int64_t>(n2_attrs.find(kBackwardNodeAttributeName) == n2_attrs.cend()) ||
-                            (n2_attrs.at(kBackwardNodeAttributeName).i() + 1) % 2;
-    if (n1_is_forward != n2_is_forward) {
-      return n2_is_forward > n1_is_forward;
+    int64_t n1_is_forward = (n1_attrs.find(__critical_execution_order) != n1_attrs.cend())
+                                ? static_cast<int64_t>(n1_attrs.at(__critical_execution_order).i())
+                                : -1;
+    int64_t n2_is_forward = (n2_attrs.find(__critical_execution_order) != n2_attrs.cend())
+                                ? static_cast<int64_t>(n2_attrs.at(__critical_execution_order).i())
+                                : -1;
+    if (n1_is_forward != -1 && n2_is_forward != -1) {
+      return n2_is_forward < n1_is_forward;
     }
+
+    // Check whether node name ends with "_recompute"
+    // if (bw_recompute_to_fw_node_map_.count(n1->Name()) && bw_recompute_to_fw_node_map_.count(n2->Name())) {
+    //   const auto& fw_n1_pair = fw_name_to_node_map_.at(bw_recompute_to_fw_node_map_.at(n1->Name()));
+    //   const auto& fw_n2_pair = fw_name_to_node_map_.at(bw_recompute_to_fw_node_map_.at(n2->Name()));
+    //   return node_name_to_timestamp_map_.at(fw_n1_pair->Name()) < node_name_to_timestamp_map_.at(fw_n2_pair->Name());
+    //   // auto t = PriorityNodeCompare(fw_name_to_node_map_, bw_recompute_to_fw_node_map_, node_name_to_timestamp_map_);
+    //   // ORT_ENFORCE(fw_n1 != nullptr, "Node ", n1->Name(), " not found in bw_name_to_node_map");
+    //   // ORT_ENFORCE(fw_n2 != nullptr, "Node ", n2->Name(), " not found in bw_name_to_node_map");
+    //   // return !t(fw_n1_pair, fw_n2_pair);  // the earlier executed in fw, the latest we expect it run in bw.
+    // }
+
 #endif
 
     // otherwise, nodes with lower index will be output first
+    // return n1->Index() > n2->Index();
+    if (node_name_to_timestamp_map_.count(n1->Name()) > 0 && node_name_to_timestamp_map_.count(n2->Name()) > 0) {
+      return node_name_to_timestamp_map_.at(n1->Name()) > node_name_to_timestamp_map_.at(n2->Name());
+    }
+
+    // std::cout << "Node " << n1->Name() << " or " << n2->Name() << " not found in node_name_to_timestamp_map" << std::endl;
+    if (node_name_to_timestamp_map_.count(n1->Name()) <= 0) {
+      std::cout << "Node " << n1->Name() << " not found in node_name_to_timestamp_map" << std::endl;
+    }
+
+    if (node_name_to_timestamp_map_.count(n2->Name()) <= 0) {
+      std::cout << "Node " << n2->Name() << " not found in node_name_to_timestamp_map" << std::endl;
+    }
     return n1->Index() > n2->Index();
   }
+
+  const InlinedHashMap<std::string, const Node*>& fw_name_to_node_map_;
+  const InlinedHashMap<std::string, std::string>& bw_recompute_to_fw_node_map_;
+  const InlinedHashMap<std::string, float>& node_name_to_timestamp_map_;
 };
 #endif
 
@@ -130,11 +170,57 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
   }
 #endif
 #if !defined(ORT_MINIMAL_BUILD)
+
+  InlinedHashMap<const Node*, size_t> node_to_execution_order_map;
+  for (size_t i = 0; i < nodes_in_topological_order_.size(); ++i) {
+    node_to_execution_order_map.insert({graph_->GetNode(nodes_in_topological_order_[i]), i});
+  }
+
+  // graph.PriorityBasedReverseDFSFrom(
+  //     leaf_nodes,
+  //     [this](const Node* n) {
+  //       std::cout << "Add Node: " << n->Name() << " Priority: " << n->Priority() << std::endl;
+  //       nodes_in_topological_order_with_priority_.push_back(n->Index());
+  //     },
+  //     PriorityNodeCompare());
+
+  // std::cout << "size of nodes_in_topological_order_with_priority_: " << nodes_in_topological_order_with_priority_.size() << std::endl;
+  // std::reverse(nodes_in_topological_order_with_priority_.begin(), nodes_in_topological_order_with_priority_.end());
+  InlinedHashMap<std::string, const Node*> fw_name_to_node_map;
+  InlinedHashMap<std::string, std::string> bw_recompute_to_fw_node_map;
+
+  InlinedHashMap<std::string, const Node*> name_to_node_map1;
+  auto ends_with = [](std::string_view name1, std::string_view ending) {
+    if (name1.size() < ending.size()) {
+      return false;
+    }
+
+    return name1.compare(name1.size() - ending.size(), ending.size(), ending) == 0;
+  };
+  constexpr std::string_view recompute_suffix = "_recompute";
+
+  for (const auto& n1 : graph.Nodes()) {
+    name_to_node_map1.insert({n1.Name(), &n1});
+  }
+
+  for (const auto& n1 : graph.Nodes()) {
+    // Check whether node name ends with "_recompute"
+    if (ends_with(n1.Name(), recompute_suffix)) {
+      auto name1_without_recompute = n1.Name().substr(0, n1.Name().size() - recompute_suffix.size());
+      fw_name_to_node_map.insert({name1_without_recompute, name_to_node_map1.at(name1_without_recompute)});
+      // bw_name_to_node_map.insert({n1.Name(), std::make_pair<const Node*, float>(name_to_node_map1.at(name1_without_recompute), 0.0f)});
+      bw_recompute_to_fw_node_map.insert({n1.Name(), name1_without_recompute});
+    }
+  }
+
+  InlinedHashMap<std::string, float> node_name_to_timestamp_map;
   graph.KahnsTopologicalSort(
       [this](const Node* n) {
+        // m.insert({n->Name(), n});  // write
         nodes_in_topological_order_with_priority_.push_back(n->Index());
       },
-      PriorityNodeCompare());
+      PriorityNodeCompare(fw_name_to_node_map, bw_recompute_to_fw_node_map, node_name_to_timestamp_map),
+      node_name_to_timestamp_map);
 #endif
 
   if (filter_info_) {

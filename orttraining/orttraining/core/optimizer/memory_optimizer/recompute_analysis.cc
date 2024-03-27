@@ -618,11 +618,7 @@ Status SelectRecomputeSubgraph(const Node& entry_node,
     nodes.clear();
   } else {
     // Re-order the nodes in topological order.
-    std::sort(nodes.begin(), nodes.end(),
-              [&node_index_to_its_order_in_topological_sort_map](const Node*& lhs, const Node*& rhs) {
-                return node_index_to_its_order_in_topological_sort_map.at(lhs->Index()) <
-                       node_index_to_its_order_in_topological_sort_map.at(rhs->Index());
-              });
+    SortNodesInTopoOrder(node_index_to_its_order_in_topological_sort_map, nodes);
   }
   return Status::OK();
 }
@@ -691,7 +687,7 @@ std::unique_ptr<NodeRecomputePlan> CheckNodeForRecompute(const GraphViewer& grap
                                                              node_index_to_its_order_in_topological_sort_map,
                                                          const InlinedHashMap<const Node*, InlinedVector<size_t>>&
                                                              candidate_output_args_map,
-                                                         const InlinedHashSet<const Node*>& layer_boundary_ln_nodes,
+                                                         const InlinedVector<const Node*>& layer_boundary_ln_nodes,
                                                          const logging::Logger& logger,
                                                          bool compromise_stashed_activation,
                                                          bool& can_compromise_stashed_activation) {
@@ -709,13 +705,14 @@ std::unique_ptr<NodeRecomputePlan> CheckNodeForRecompute(const GraphViewer& grap
       auto output_name = node.OutputDefs()[output_index]->Name();
       auto consumers = graph_viewer.GetConsumerNodes(output_name);
       for (auto& consumer : consumers) {
-        if (layer_boundary_ln_nodes.find(consumer) != layer_boundary_ln_nodes.end()) {
+        if (std::find(layer_boundary_ln_nodes.begin(), layer_boundary_ln_nodes.end(), consumer) !=
+            layer_boundary_ln_nodes.end()) {
           int dest_in_index = optimizer_utils::IndexOfNodeInput(*consumer, *node.OutputDefs()[output_index]);
           if (dest_in_index == 0) {
-            LOGS(logger, INFO) << "Node " << node.Name() << "(" << node.OpType()
-                               << ") is a Attention+MLP layer boundary node, "
-                               << "its stashed activation outputs are used by LayerNormalization's inputs, "
-                               << "we don't need to recompute it.";
+            std::cout << "Node " << node.Name() << "(" << node.OpType()
+                      << ") is a Attention+MLP layer boundary node, "
+                      << "its stashed activation outputs are used by LayerNormalization's inputs, "
+                      << "we don't need to recompute it." << std::endl;
             return nullptr;
           }
         }
