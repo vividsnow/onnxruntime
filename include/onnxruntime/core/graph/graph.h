@@ -1083,7 +1083,8 @@ class Graph {  // NOLINT(clang-analyzer-optin.performance.Padding): preserve exi
   @param comp Comparison function to stabilize the traversal order by making Node ordering deterministic.
   */
   void KahnsTopologicalSort(const std::function<void(const Node*)>& enter,
-                            const std::function<bool(const Node*, const Node*)>& comp) const;
+                            const std::function<bool(const Node*, const Node*)>& comp,
+                            InlinedHashMap<std::string, float>& node_name_to_timestamp_map) const;
 
 #endif
 

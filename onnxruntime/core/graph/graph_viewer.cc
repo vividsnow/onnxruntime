@@ -12,6 +12,9 @@ bool NodeCompare::operator()(const Node* n1, const Node* n2) const {
 
 #if !defined(ORT_MINIMAL_BUILD)
 struct PriorityNodeCompare {
+  PriorityNodeCompare(const InlinedHashMap<std::string, float>& node_name_to_timestamp_map)
+      : node_name_to_timestamp_map_(node_name_to_timestamp_map) {}
+
   inline bool IsHighPri(const Node* n) const {
     // local statics so we can compare std::strings in the checks
     static constexpr std::string_view shape_op("Shape");
@@ -40,6 +43,7 @@ struct PriorityNodeCompare {
     }
 
 #ifdef ENABLE_TRAINING
+
     // nodes of forward pass will be output first
     auto n1_attrs = n1->GetAttributes();
     auto n2_attrs = n2->GetAttributes();
@@ -50,11 +54,31 @@ struct PriorityNodeCompare {
     if (n1_is_forward != n2_is_forward) {
       return n2_is_forward > n1_is_forward;
     }
+
+    // // nodes of bigger impact pass will be output first
+    // const auto& n1_attrs = n1->GetAttributes();
+    // const auto& n2_attrs = n2->GetAttributes();
+    // int64_t n1_is_forward = (n1_attrs.find(kRecomputeNodeCriticalPathImpact) != n1_attrs.cend())
+    //                             ? static_cast<int64_t>(n1_attrs.at(kRecomputeNodeCriticalPathImpact).i())
+    //                             : -1;
+    // int64_t n2_is_forward = (n2_attrs.find(kRecomputeNodeCriticalPathImpact) != n2_attrs.cend())
+    //                             ? static_cast<int64_t>(n2_attrs.at(kRecomputeNodeCriticalPathImpact).i())
+    //                             : -1;
+    // if (n1_is_forward != -1 && n2_is_forward != -1) {
+    //   return n2_is_forward > n1_is_forward;
+    // }
 #endif
+
+    // if (node_name_to_timestamp_map_.count(n1->Name()) > 0 && node_name_to_timestamp_map_.count(n2->Name()) > 0) {
+    //   return node_name_to_timestamp_map_.at(n1->Name()) > node_name_to_timestamp_map_.at(n2->Name());
+    // }
 
     // otherwise, nodes with lower index will be output first
     return n1->Index() > n2->Index();
   }
+
+ private:
+  const InlinedHashMap<std::string, float>& node_name_to_timestamp_map_;
 };
 #endif
 
@@ -130,11 +154,15 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
   }
 #endif
 #if !defined(ORT_MINIMAL_BUILD)
+
+  InlinedHashMap<std::string, float> node_name_to_timestamp_map;
+
   graph.KahnsTopologicalSort(
       [this](const Node* n) {
         nodes_in_topological_order_with_priority_.push_back(n->Index());
       },
-      PriorityNodeCompare());
+      PriorityNodeCompare(node_name_to_timestamp_map),
+      node_name_to_timestamp_map);
 #endif
 
   if (filter_info_) {

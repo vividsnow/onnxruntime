@@ -16,13 +16,78 @@
 
 namespace onnxruntime::optimizer::memory_optimizer {
 
+namespace {
+
+std::tuple<bool, const Node*, const Node*> IsResidualNodeArg(const GraphViewer& graph_viewer, const NodeArg* node_arg) {
+  auto consumers = graph_viewer.GetConsumerNodes(node_arg->Name());
+  if (2 != consumers.size()) {
+    return std::make_tuple(false, nullptr, nullptr);
+  }
+
+  // Find the Add node from the consumer list.
+  const Node* add_node = nullptr;
+  const Node* other_node = nullptr;
+  for (const auto* consumer : consumers) {
+    // At this point, there should not be any recompute node, so we don't need check the node existence in node_index_to_its_order_in_topological_sort_map.
+    if (consumer->OpType() == "Add") {
+      add_node = consumer;
+    } else {
+      other_node = consumer;
+    }
+  }
+
+  return std::make_tuple(add_node != nullptr && other_node != nullptr, add_node, other_node);
+}
+}  // namespace
+
+/*
+    One classical layer includes 1). input layer norm, 2). attention, 3). residual add (input layer norm input + attention output),
+    4). post attention layer norm feedforward, and 5). residual add (post attention layer norm input + feedforward out).
+
+    The pattern graph looks like below for each transformer layer (taking the example of MistralDecoderLayer):
+                            |
+                        Embedding
+                            |
+                            |
+      ----------------------|
+      |                     |
+      |                     |
+      |        SimplifiedLayerNormalization (layer boudary node)
+      |                     |
+      |                     |
+      |               MistralAttention
+      |                     |
+      |                     |
+      |____________________Add
+                            |
+      ----------------------|
+      |                     |
+      |                     |
+      |         SimplifiedLayerNormalization
+      |                     |
+      |                     |
+      |            MultipleLayerPerception
+      |                     |
+      |                     |
+      |____________________Add
+                            |
+                        (new layer)
+      ----------------------|
+      |                     |
+      |                     |
+      |         SimplifiedLayerNormalization (layer boudary node E we found earlier)
+                                  ....
+
+  Be noted: we need shift a bit around the layer boundary node S and E, as the layer boundary node S and E are not the real boundary nodes now.
+  Specifically, we shift two nodes (PostBackwardFunction and ORTZeROOffloadPreForwardFunction) before S and E as the real boundary nodes.
+*/
 void FindLayerBoundaryLayerNormNodes(
     const GraphViewer& graph_viewer,
     const logging::Logger&,
     const InlinedHashMap<NodeIndex, ptrdiff_t>&
         node_index_to_its_order_in_topological_sort_map,
     const ptrdiff_t& yield_op_order_in_topological_sort,
-    InlinedVector<const Node*>& layer_boundary_ln_nodes) {
+    InlinedHashVector<const Node*>& layer_boundary_ln_nodes) {
   // Loop all nodes to find LayerNormalization nodes.
   // For each LayerNormalization node, keep checking its output nodes,
   // until find a node that is Softmax or BiasSoftmax or another LayerNormalization.
@@ -48,20 +113,47 @@ void FindLayerBoundaryLayerNormNodes(
       continue;
     }
 
+    const NodeArg* input_arg = node.InputDefs()[0];
+
+    // IsResidualNodeArg checks input_arg
+    auto [is_residual_node_arg, add_node, other_node] = IsResidualNodeArg(graph_viewer, input_arg);
+    if (!is_residual_node_arg) {
+      continue;
+    }
+
+    ptrdiff_t attention_residual_add_node_order = node_index_to_its_order_in_topological_sort_map.at(add_node->Index());
+    ptrdiff_t attention_residual_ln_node_order = node_index_to_its_order_in_topological_sort_map.at(other_node->Index());
+    if (attention_residual_add_node_order >= yield_op_order_in_topological_sort ||
+        attention_residual_ln_node_order >= yield_op_order_in_topological_sort ||
+        layernorm_ops.find(other_node->OpType()) == layernorm_ops.end()) {
+      continue;
+    }
+
+    // IsResidualNodeArg checks add_node->OutputDefs()[0]
+    auto [is_residual_node_arg_2, add_node_2, other_node_2] = IsResidualNodeArg(graph_viewer, add_node->OutputDefs()[0]);
+    if (!is_residual_node_arg_2) {
+      continue;
+    }
+
+    ptrdiff_t attention_residual_add_node_order_2 = node_index_to_its_order_in_topological_sort_map.at(add_node_2->Index());
+    ptrdiff_t attention_residual_ln_node_order_2 = node_index_to_its_order_in_topological_sort_map.at(other_node_2->Index());
+    if (attention_residual_add_node_order_2 >= yield_op_order_in_topological_sort ||
+        attention_residual_ln_node_order_2 >= yield_op_order_in_topological_sort ||
+        layernorm_ops.find(other_node_2->OpType()) == layernorm_ops.end()) {
+      continue;
+    }
+
+    // Search all forward nodes that is before `add_node` in topo order, unless we find a softmax or nodes_to_check is empty.
     std::deque<const Node*> nodes_to_check;
     std::set<const Node*> visited_nodes;
     for (auto node_it = node.OutputNodesBegin(); node_it != node.OutputNodesEnd(); ++node_it) {
       // Ignore those nodes after YieldOp.
-      if (node_index_to_its_order_in_topological_sort_map.at(node_it->Index()) < yield_op_order_in_topological_sort) {
+      auto order = node_index_to_its_order_in_topological_sort_map.at(node_it->Index());
+      if (order < yield_op_order_in_topological_sort && order < attention_residual_add_node_order) {
         nodes_to_check.push_back(&(*node_it));
       }
     }
 
-    // For a perfect layer match, all those three flags should be true after exiting while loop.
-    // except the layernorm after the last layer, which expects no more softmax and layernorm are found.
-    bool found_softmax = false;
-    bool found_mid_layernorm = false;
-    bool found_end_layernorm = false;
     while (!nodes_to_check.empty()) {
       const Node* next_node = nodes_to_check.front();
       nodes_to_check.pop_front();
@@ -72,39 +164,16 @@ void FindLayerBoundaryLayerNormNodes(
 
       visited_nodes.insert(next_node);
       if (softmax_ops.find(next_node->OpType()) != softmax_ops.end()) {
-        found_softmax = true;
-      } else if (layernorm_ops.find(next_node->OpType()) != layernorm_ops.end()) {
-        // mid layernorm MUST appear before end layernorm, because it is a single in and out connector (despite of its weights)
-        if (found_mid_layernorm) {
-          found_end_layernorm = true;
-          // std::cout << "Found end LayerNormalization node 3333." << next_node->Name() << std::endl;
-          break;  // exit the while loop since we found the end LayerNormalization node.
-        } else {
-          // std::cout << "Found mid LayerNormalization node 4444." << next_node->Name() << std::endl;
-          found_mid_layernorm = true;
-        }
+        layer_boundary_ln_nodes.push_back(&node);
+        break;
       }
 
       for (auto node_it = next_node->OutputNodesBegin(); node_it != next_node->OutputNodesEnd(); ++node_it) {
-        // Stop if the node is after YieldOp.
-        if (node_index_to_its_order_in_topological_sort_map.at(node_it->Index()) >= yield_op_order_in_topological_sort) {
-          continue;
+        // Stop if the node is after next Layernorm node in execution order.
+        auto order = node_index_to_its_order_in_topological_sort_map.at(node_it->Index());
+        if (order < yield_op_order_in_topological_sort && order < attention_residual_add_node_order) {
+          nodes_to_check.push_back(&(*node_it));
         }
-        nodes_to_check.push_back(&(*node_it));
-      }
-    }
-
-    if (found_softmax && found_mid_layernorm && found_end_layernorm) {
-      // std::cout << "Found LayerNormalization node 1111." << std::endl;
-      if (std::find(layer_boundary_ln_nodes.begin(), layer_boundary_ln_nodes.end(), &node) == layer_boundary_ln_nodes.end()) {
-        layer_boundary_ln_nodes.push_back(&node);
-      }
-    } else if (!found_softmax && !found_mid_layernorm && !found_end_layernorm) {
-      // std::cout << "Found LayerNormalization node 2222." << found_mid_layernorm << found_mid_layernorm << found_end_layernorm << std::endl;
-      // If no Softmax found, and no other LayerNormalization found, this should be the last LayerNormalization node,
-      // we also consider it as boundary node.
-      if (std::find(layer_boundary_ln_nodes.begin(), layer_boundary_ln_nodes.end(), &node) == layer_boundary_ln_nodes.end()) {
-        layer_boundary_ln_nodes.push_back(&node);
       }
     }
   }

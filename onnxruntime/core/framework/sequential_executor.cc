@@ -186,10 +186,14 @@ class SessionScope {
     const auto& exec_plan_vec = seq_exec_plan.execution_plan;
     VLOGS(logger, 1) << "Size of execution plan vector: " << exec_plan_vec.size();
 
-// Enable TRACE_EXECUTION compile flag to dump execution plan
-#if defined(TRACE_EXECUTION)
-    std::cout << std::make_pair(&seq_exec_plan, &session_state) << std::endl;
-#endif
+    // Enable TRACE_EXECUTION compile flag to dump execution plan
+    // #if defined(TRACE_EXECUTION)
+    static bool trace_execution = false;
+    if (!trace_execution) {
+      trace_execution = true;
+      std::cout << std::make_pair(&seq_exec_plan, &session_state) << std::endl;
+    }
+// #endif
 #if defined(ORT_MINIMAL_BUILD) || !defined(ORT_MEMORY_PROFILE)
     ORT_UNUSED_PARAMETER(frame);
 #endif

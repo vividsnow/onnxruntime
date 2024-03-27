@@ -58,5 +58,6 @@ constexpr const char* kExecutionProviderSharedLibraryEntry = "provider_factory_e
 
 // For Priority based graph topology sorting.
 constexpr const char* kBackwardNodeAttributeName = "__backwardpass";
+constexpr const char* kRecomputeNodeCriticalPathImpact = "__recompute_critical_path_impact";
 
 }  // namespace onnxruntime
