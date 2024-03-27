@@ -143,7 +143,7 @@ Status SimpleOpBuilder::ProcessInputs(QnnModelWrapper& qnn_model_wrapper,
       // QNN Matmul bias only supports UFIXED_POINT_8 & SFIXED_POINT_32, use SFIXED_POINT_32 here
       std::vector<uint8_t> matmul_bias(bias_size * 4, 0);
 
-      std::string bias_input_name = inputs[0].node_arg.Name() + "_bias";
+      std::string bias_input_name = inputs[0].node_arg.Name() + outputs[0].node_arg.Name() + "_bias";
       Qnn_QuantizeParams_t quantize_param = QNN_QUANTIZE_PARAMS_INIT;
       std::vector<uint32_t> bias_shape{bias_size};
       QnnTensorWrapper input_tensorwrapper(bias_input_name, QNN_TENSOR_TYPE_STATIC, QNN_DATATYPE_SFIXED_POINT_32,
