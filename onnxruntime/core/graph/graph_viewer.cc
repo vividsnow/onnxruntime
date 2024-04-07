@@ -117,18 +117,18 @@ struct GroupNode {
   GroupNode() {
   }
 
-  GroupNode(const Node* node) {
-    nodes.push_back(node);
-    // priority = node->Priority();
-    // single_node = true;
-    for (const NodeArg* arg : node->InputDefs()) {
-      input_args.push_back(arg);
-    }
+  // GroupNode(const Node* node) {
+  //   nodes.push_back(node);
+  //   // priority = node->Priority();
+  //   // single_node = true;
+  //   for (const NodeArg* arg : node->InputDefs()) {
+  //     input_args.push_back(arg);
+  //   }
 
-    for (const NodeArg* arg : node->OutputDefs()) {
-      output_args.push_back(arg);
-    }
-  }
+  //   for (const NodeArg* arg : node->OutputDefs()) {
+  //     output_args.push_back(arg);
+  //   }
+  // }
 
   GroupNode(const InlinedVector<const Node*>& nodes,
             const InlinedVector<const NodeArg*>& input_args,
@@ -150,6 +150,8 @@ struct GroupNode {
   InlinedVector<const Node*> nodes;
   InlinedVector<const NodeArg*> input_args;
   InlinedVector<const NodeArg*> output_args;
+
+  bool output_completed = false;
   // InlinedVector<const Node*> input_edge_nodes;
   // InlinedVector<const Node*> output_consumer_nodes;
 
@@ -258,8 +260,6 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
         },
         NodeCompare());
 
-    node_orders.push_back(yield_node->Index());
-
     auto sort = [this, &nodes_before_yieldop, &backward_input_nodes, &graph](
                     const std::function<void(const Node*)>& enter,
                     const std::function<bool(const Node*, const Node*)>& comp,
@@ -278,16 +278,27 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
           continue;
         }
 
-        size_t input_edge_count = node.GetInputEdgesCount();
-        in_degree[node.Index()] = input_edge_count;
-        if (input_edge_count == 0) {  // A shortcut.
+        if (node.OpType() == "YieldOp") {
+          in_degree[node.Index()] = 0;
+          std::cout << "push " << node.Name() << " into queue (YieldOp)" << std::endl;
           to_visit.push(&node);
           continue;
         }
 
-        for (auto it = node.InputNodesBegin(); it != node.InputNodesEnd(); ++it) {
+        size_t input_edge_count = node.GetInputEdgesCount();
+        in_degree[node.Index()] = input_edge_count;
+        // input_edge_count will not be 0 any way, because it will have at least one input edge from YieldOp or forward nodes.
+
+        // if (input_edge_count == 0) {  // A shortcut.
+        //   std::cout << "push " << node.Name() << " into branch_input_nodes" << std::endl;
+        //   branch_input_nodes.push(&node);
+        //   continue;
+        // }
+
+        for (auto input_edge_it = node.InputEdgesBegin(); input_edge_it != node.InputEdgesEnd(); ++input_edge_it) {
+          const Node* input_node = &input_edge_it->GetNode();
           // If the input edge connect to forward nodes, then we remove the in_degree of the node.
-          if (nodes_before_yieldop.find(&*it) != nodes_before_yieldop.end()) {
+          if (nodes_before_yieldop.find(input_node) != nodes_before_yieldop.end()) {
             input_edge_count--;
           }
         }
@@ -295,121 +306,154 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
         in_degree[node.Index()] = input_edge_count;
         if (input_edge_count == 0) {
           branch_input_nodes.push_back(&node);
+          std::cout << "push " << node.Name() << " into branch_input_nodes" << std::endl;
           // Don't append to to_visit, we will visit it later.
           // to_visit.push(GroupNode(&node));
         }
       }
 
-      InlinedHashMap<const NodeArg*, GroupNode*> output_arg_to_grouped_node;
       // Loop through the branch_input_nodes to find the branch subgraphs by its output edges in BFS,
       // and find the maximum self_contained subgraph taking the branch_input_nodes as input nodes.
-      {
-        InlinedVector<const Node*> branch_subgraph;
-        std::queue<const Node*> to_visit;
-        InlinedHashSet<const NodeArg*> branch_trigger_node_args;
-        InlinedVector<size_t> in_degree_copy = in_degree;
 
-        // add all nodes in branch_input_nodes to the queue
-        for (auto branch_input_node : branch_input_nodes) {
-          to_visit.push(branch_input_node);
-          branch_subgraph.push_back(branch_input_node);
-        }
-        // to_visit.push(branch_input_node);
-        // visited.insert(branch_input_node);
+      InlinedVector<const Node*> branch_subgraph;
+      std::queue<const Node*> to_visit_queue;
+      InlinedHashSet<const NodeArg*> branch_trigger_node_args;
+      InlinedVector<size_t> in_degree_copy = in_degree;
 
-        while (!to_visit.empty()) {
-          const Node* current = to_visit.front();
-          to_visit.pop();
+      // add all nodes in branch_input_nodes to the queue
+      for (auto branch_input_node : branch_input_nodes) {
+        to_visit_queue.push(branch_input_node);
+        branch_subgraph.push_back(branch_input_node);
+      }
+      // to_visit.push(branch_input_node);
+      // visited.insert(branch_input_node);
 
-          if (!current) continue;
+      while (!to_visit_queue.empty()) {
+        const Node* current = to_visit_queue.front();
+        to_visit_queue.pop();
 
-          if (enter) {
-            enter(current);
+        if (!current) continue;
+
+        // if (enter) {
+        //   enter(current);
+        // }
+
+        for (auto node_it = current->OutputNodesBegin(); node_it != current->OutputNodesEnd(); ++node_it) {
+          auto& node_in_degree = in_degree_copy[node_it->Index()];
+          node_in_degree--;
+
+          if (node_in_degree == 0) {
+            to_visit_queue.push(&*node_it);
+            branch_subgraph.push_back(&*node_it);
+            for (const NodeArg* output_arg : node_it->OutputDefs()) {
+              branch_trigger_node_args.insert(output_arg);
+            }
           }
+        }
+      }
 
-          for (auto node_it = current->OutputNodesBegin(); node_it != current->OutputNodesEnd(); ++node_it) {
-            auto& node_in_degree = in_degree_copy[node_it->Index()];
-            node_in_degree--;
+      // At this point, branch_subgraph is a bigger subgraph that contains all the nodes that are purely
+      // triggered by the branch_input_nodes.
+      InlinedVector<std::pair<const Node*, size_t>> branch_subgraph_consumers;
+      InlinedVector<const NodeArg*> branch_subgraph_output_args;
+      for (const Node* n : branch_subgraph) {
+        for (auto output_it = n->OutputEdgesBegin(); output_it != n->OutputEdgesEnd(); ++output_it) {
+          const Node* output_node = &output_it->GetNode();
+          const size_t dest_in_port = output_it->GetDstArgIndex();
+          if (std::find(branch_subgraph.begin(), branch_subgraph.end(), output_node) == branch_subgraph.end()) {
+            branch_subgraph_consumers.push_back({output_node, dest_in_port});
+            if (std::find(branch_subgraph_output_args.begin(), branch_subgraph_output_args.end(),
+                          output_node->InputDefs()[dest_in_port]) == branch_subgraph_output_args.end()) {
+              branch_subgraph_output_args.push_back(output_node->InputDefs()[dest_in_port]);
+            }
+          }
+        }
+      }
 
-            if (node_in_degree == 0) {
-              to_visit.push(&*node_it);
-              branch_subgraph.push_back(&*node_it);
-              for (const NodeArg* output_arg : node_it->OutputDefs()) {
-                branch_trigger_node_args.insert(output_arg);
+      InlinedVector<const NodeArg*> branch_subgraph_input_args;
+      for (const Node* n : branch_subgraph) {
+        for (const NodeArg* input_arg : n->InputDefs()) {
+          if (std::find(branch_subgraph_output_args.begin(), branch_subgraph_output_args.end(), input_arg) ==
+              branch_subgraph_output_args.end()) {
+            branch_subgraph_input_args.push_back(input_arg);
+          }
+        }
+      }
+
+      GroupNode initial_group(branch_subgraph, branch_subgraph_input_args, branch_subgraph_output_args);
+      // Print the input and output node of the branch subgraph.
+      std::cout << "Branch subgraph input nodes: ";
+      for (const NodeArg* arg : initial_group.input_args) {
+        std::cout << arg->Name() << " ";
+      }
+      std::cout << std::endl;
+      std::cout << "Branch subgraph output nodes: ";
+      for (const NodeArg* arg : initial_group.output_args) {
+        std::cout << arg->Name() << " ";
+      }
+      std::cout << std::endl;
+
+      // Reverse DFS from initial graph outputs (e.g. branch_subgraph_consumers) to tag each nodes:
+      // If one node N contributes to a graph output A, then we will tag A to N.
+      // If the node N contributes to multiple graph outputs A, B, C, then we will tag the A, B, C to N.
+      InlinedHashMap<const Node*, std::set<const NodeArg*>> node_to_its_associated_outputs;
+      for (const auto& consumer : branch_subgraph_consumers) {
+        const NodeArg* output_arg = consumer.first->InputDefs()[consumer.second];
+        const Node* end_node = GetProducerNode(output_arg->Name());
+        InlinedVector<const Node*> end_nodes{end_node};
+        graph.ReverseDFSFrom(
+            end_nodes,
+            nullptr,
+            [&node_to_its_associated_outputs, &output_arg](const Node* n) {
+              std::cout << "Node named " << n->Name() << " is associated with output " << output_arg->Name() << std::endl;
+              node_to_its_associated_outputs[n].insert(output_arg);
+            },
+            nullptr,
+            [&nodes_before_yieldop](const Node*, const Node* to) -> bool {
+              if (nodes_before_yieldop.find(to) != nodes_before_yieldop.end()) {
+                return true;  // Skip forward nodes.
               }
-            }
-          }
-        }
 
-        // At this point, branch_subgraph is a bigger subgraph that contains all the nodes that are purely
-        // triggered by the branch_input_nodes.
-        InlinedVector<std::pair<const Node*, size_t>> branch_subgraph_consumers;
-        InlinedVector<const NodeArg*> branch_subgraph_output_args;
-        for (const Node* n : branch_subgraph) {
-          for (auto output_it = n->OutputEdgesBegin(); output_it != n->OutputEdgesEnd(); ++output_it) {
-            const Node* output_node = &output_it->GetNode();
-            const size_t dest_in_port = output_it->GetDstArgIndex();
-            if (std::find(branch_subgraph.begin(), branch_subgraph.end(), output_node) == branch_subgraph.end()) {
-              branch_subgraph_consumers.push_back({output_node, dest_in_port});
-              if (std::find(branch_subgraph_output_args.begin(), branch_subgraph_output_args.end(),
-                            output_node->InputDefs()[dest_in_port]) == branch_subgraph_output_args.end()) {
-                branch_subgraph_output_args.push_back(output_node->InputDefs()[dest_in_port]);
+              if (to->OpType() == "YieldOp") {
+                return true;  // Skip YieldOp. In theory, we should not reach here.
               }
+
+              return false;
+            });
+      }
+
+      // Cluster the nodes in the branch_subgraph based on the associated outputs.
+      InlinedHashMap<std::set<const NodeArg*>, GroupNode> output_to_grouped_node;
+
+      for (const auto& node : branch_subgraph) {
+        const auto& associated_outputs = node_to_its_associated_outputs[node];
+
+        if (output_to_grouped_node.find(associated_outputs) == output_to_grouped_node.end()) {
+          output_to_grouped_node[associated_outputs] = GroupNode();
+
+          output_to_grouped_node[associated_outputs].output_args.insert(output_to_grouped_node[associated_outputs].output_args.end(),
+                                                                        associated_outputs.begin(), associated_outputs.end());
+        }
+
+        output_to_grouped_node[associated_outputs].nodes.push_back(node);
+
+        if (std::find(branch_input_nodes.begin(), branch_input_nodes.end(), node) != branch_input_nodes.end()) {
+          for (const NodeArg* arg : node->InputDefs()) {
+            if (std::find(output_to_grouped_node[associated_outputs].input_args.begin(),
+                          output_to_grouped_node[associated_outputs].input_args.end(), arg) ==
+                output_to_grouped_node[associated_outputs].input_args.end()) {
+              output_to_grouped_node[associated_outputs].input_args.push_back(arg);
             }
           }
         }
+      }
 
-        InlinedVector<const NodeArg*> branch_subgraph_input_args;
-        for (const Node* n : branch_subgraph) {
-          for (const NodeArg* input_arg : n->InputDefs()) {
-            if (std::find(branch_subgraph_output_args.begin(), branch_subgraph_output_args.end(), input_arg) ==
-                branch_subgraph_output_args.end()) {
-              branch_subgraph_input_args.push_back(input_arg);
-            }
-          }
-        }
-
-        GroupNode initial_group(branch_subgraph, branch_subgraph_input_args, branch_subgraph_output_args);
-
-        // Reverse DFS from initial graph outputs (e.g. branch_subgraph_consumers) to tag each nodes:
-        // If one node N contributes to a graph output A, then we will tag A to N.
-        // If the node N contributes to multiple graph outputs A, B, C, then we will tag the A, B, C to N.
-        InlinedHashMap<const Node*, std::set<const NodeArg*>> node_to_its_associated_outputs;
-        for (const auto& consumer : branch_subgraph_consumers) {
-          const NodeArg* output_arg = consumer.first->InputDefs()[consumer.second];
-          const Node* end_node = GetProducerNode(output_arg->Name());
-          InlinedVector<const Node*> end_nodes{end_node};
-          graph.ReverseDFSFrom(
-              end_nodes,
-              nullptr,
-              [&node_to_its_associated_outputs, &output_arg](const Node* n) {
-                node_to_its_associated_outputs[n].insert(output_arg);
-              },
-              nullptr);
-        }
-
-        // Cluster the nodes in the branch_subgraph based on the associated outputs.
-        InlinedHashMap<std::set<const NodeArg*>, GroupNode> output_to_grouped_node;
-
-        for (const auto& node : branch_subgraph) {
-          const auto& associated_outputs = node_to_its_associated_outputs[node];
-
-          output_to_grouped_node[associated_outputs].nodes.push_back(node);
-
-          if (std::find(branch_input_nodes.begin(), branch_input_nodes.end(), node) != branch_input_nodes.end()) {
-            output_to_grouped_node[associated_outputs].input_args.insert(output_to_grouped_node[associated_outputs].input_args.end(),
-                                                                         node->InputDefs().begin(), node->InputDefs().end());
-          }
-          // output_to_grouped_node[associated_outputs].output_args.insert(output_to_grouped_node[associated_outputs].output_args.end(),
-          //                                                               node->OutputDefs().begin(), node->OutputDefs().end());
-        }
-
-        // Flatten the key into NodeArg* for better search.
-        InlinedHashMap<const NodeArg*, GroupNode*> output_arg_to_grouped_node;
-        for (auto& [output_args, grouped_node] : output_to_grouped_node) {
-          for (const auto& output_arg : output_args) {
-            output_arg_to_grouped_node[output_arg] = &grouped_node;
-          }
+      // Flatten the key into NodeArg* for better search.
+      InlinedHashMap<const NodeArg*, GroupNode*> output_arg_to_grouped_node;
+      for (auto& [output_args, grouped_node] : output_to_grouped_node) {
+        for (const auto& output_arg : output_args) {
+          std::cout << ">>>>> output_arg: " << output_arg->Name() << " is generated by group node" << std::endl;
+          output_arg_to_grouped_node[output_arg] = &grouped_node;
         }
       }
 
@@ -421,15 +465,24 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
         if (!current) continue;
 
         if (enter) {
+          std::cout << "enter " << current->Name() << std::endl;
           for (auto input_edge_it = current->InputEdgesBegin(); input_edge_it != current->InputEdgesEnd(); ++input_edge_it) {
             const NodeArg* input_arg = current->InputDefs()[input_edge_it->GetDstArgIndex()];
             if (already_ready.find(input_arg) == already_ready.end() && output_arg_to_grouped_node.find(input_arg) != output_arg_to_grouped_node.end()) {
-              for (const Node* n : output_arg_to_grouped_node[input_arg]->nodes) {
-                node_orders.push_back(n->Index());
-              }
+              if (!output_arg_to_grouped_node[input_arg]->output_completed) {
+                std::cout << "insert group node for " << input_arg->Name() << std::endl;
+                for (const Node* n : output_arg_to_grouped_node[input_arg]->nodes) {
+                  std::cout << "pengwa<<<" << n->Name() << std::endl;
+                  node_orders.push_back(n->Index());
+                  topo_order.push_back(n->Index());
+                }
 
-              for (const NodeArg* output_arg : output_arg_to_grouped_node[input_arg]->output_args) {
-                already_ready.insert(output_arg);
+                for (const NodeArg* output_arg : output_arg_to_grouped_node[input_arg]->output_args) {
+                  std::cout << "update already_ready for output_arg: " << output_arg->Name() << std::endl;
+                  already_ready.insert(output_arg);
+                }
+
+                output_arg_to_grouped_node[input_arg]->output_completed = true;
               }
             }
           }
@@ -441,11 +494,13 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
           }
         }
 
-        for (auto node_it = current->OutputNodesBegin(); node_it != current->OutputNodesEnd(); ++node_it) {
+        for (auto output_edge_it = current->OutputEdgesBegin(); output_edge_it != current->OutputEdgesEnd(); ++output_edge_it) {
+          const Node* node_it = &output_edge_it->GetNode();
           auto& node_in_degree = in_degree[node_it->Index()];
           node_in_degree--;
 
           if (node_in_degree == 0) {
+            std::cout << "push " << node_it->Name() << " into queue" << std::endl;
             to_visit.push(&*node_it);
             continue;
           }
@@ -453,30 +508,37 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
           InlinedVector<const NodeArg*> left_args_generated_by_group_node;
           for (auto input_edge_it = node_it->InputEdgesBegin(); input_edge_it != node_it->InputEdgesEnd(); ++input_edge_it) {
             const NodeArg* input_arg = node_it->InputDefs()[input_edge_it->GetDstArgIndex()];
+            // std::cout << "loop input_arg: " << input_arg->Name() << (already_ready.find(input_arg) == already_ready.end()) << std::endl;
             if (already_ready.find(input_arg) == already_ready.end() && output_arg_to_grouped_node.find(input_arg) != output_arg_to_grouped_node.end()) {
+              std::cout << "insert group node for " << input_arg->Name() << std::endl;
               left_args_generated_by_group_node.push_back(input_arg);
             }
           }
+
+          std::cout << "node " << node_it->Name() << " has " << left_args_generated_by_group_node.size() << " left args, node_in_degreee: " << node_in_degree << std::endl;
 
           if (node_in_degree == left_args_generated_by_group_node.size()) {
             // for (auto& input_arg : left_args_generated_by_group_node) {
             //   to_visit.push(output_arg_to_grouped_node[input_arg]);
             // }
+            node_in_degree -= left_args_generated_by_group_node.size();
+            std::cout << "push " << node_it->Name() << " into queue (groupnode)" << std::endl;
             to_visit.push(&*node_it);
           }
         }
+
         topo_order.push_back(current->Index());
       }
 
       if (number_of_nodes != topo_order.size()) {
-        ORT_THROW("Some nodes are not included in the topological sort, graph have a cycle.");
+        ORT_THROW("Some nodes are not included in the topological sort, graph have a cycle. " + std::to_string(number_of_nodes) + " vs " + std::to_string(topo_order.size()));
       }
     };
 
-    sort([&node_orders](const Node* n) -> void { node_orders.push_back(n->Index()); }, PriorityNodeCompare(), node_orders);
+    sort([&node_orders](const Node* n) -> void { node_orders.push_back(n->Index()); std::cout << "pengwa<<<<" << n->Name() << std::endl; }, PriorityNodeCompare(), node_orders);
 
     nodes_in_topological_order_with_priority_ = node_orders;
-    ORT_ENFORCE(nodes_in_topological_order_with_priority_.size() == static_cast<size_t>(NumberOfNodes()));
+    ORT_ENFORCE(nodes_in_topological_order_with_priority_.size() == static_cast<size_t>(NumberOfNodes()), "Topological sort failed.", nodes_in_topological_order_with_priority_.size(), "!=", NumberOfNodes());
   } else {
     graph.KahnsTopologicalSort(
         [this](const Node* n) {
