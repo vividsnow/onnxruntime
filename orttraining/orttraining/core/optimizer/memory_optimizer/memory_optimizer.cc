@@ -329,7 +329,7 @@ Status MemoryOptimizer::CreateRecomputeGraph(Graph& graph,
                                          &node_to_duplicate->GetAttributes(),
                                          node_to_duplicate->Domain());
 
-    recompute_node.SetPriority(static_cast<int>(ExecutionPriority::LOCAL_LOW));
+    // recompute_node.SetPriority(static_cast<int>(ExecutionPriority::LOCAL_LOW));
     recompute_node.SetExecutionProviderType(node_to_duplicate->GetExecutionProviderType());
     ORT_RETURN_IF_NOT(graph.SetOpSchemaFromRegistryForNode(recompute_node),
                       "Failed to set op schema for added recompute node.");
