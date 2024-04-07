@@ -263,6 +263,7 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
       }
     }
   }
+
 #endif
 
 #if !defined(ORT_MINIMAL_BUILD)
@@ -340,20 +341,10 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
           }
         }
 
-        // if (all_input_arg_from_forward_nodes) {
-        //   branch_input_nodes.push_back(&node);
-        //   std::cout << "push " << node.Name() << " into branch_input_nodes" << std::endl;
-        //   // for (const NodeArg* input_arg : node.InputDefs()) {
-        //   //   already_ready.insert(input_arg);
-        //   // }
-        // }
-
         in_degree[node.Index()] = input_edge_count;
         if (input_edge_count == 0) {
           branch_input_nodes.push_back(&node);
           std::cout << "push " << node.Name() << " into branch_input_nodes" << std::endl;
-          //   // Don't append to to_visit, we will visit it later.
-          //   // to_visit.push(GroupNode(&node));
         }
       }
 
@@ -476,22 +467,9 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
 
         if (output_to_grouped_node.find(associated_outputs) == output_to_grouped_node.end()) {
           output_to_grouped_node[associated_outputs] = GroupNode();
-
-          // output_to_grouped_node[associated_outputs].output_args.insert(output_to_grouped_node[associated_outputs].output_args.end(),
-          //                                                               associated_outputs.begin(), associated_outputs.end());
         }
 
         output_to_grouped_node[associated_outputs].nodes.push_back(node);
-
-        // if (std::find(branch_input_nodes.begin(), branch_input_nodes.end(), node) != branch_input_nodes.end()) {
-        //   for (const NodeArg* arg : node->InputDefs()) {
-        //     if (std::find(output_to_grouped_node[associated_outputs].input_args.begin(),
-        //                   output_to_grouped_node[associated_outputs].input_args.end(), arg) ==
-        //         output_to_grouped_node[associated_outputs].input_args.end()) {
-        //       output_to_grouped_node[associated_outputs].input_args.push_back(arg);
-        //     }
-        //   }
-        // }
       }
 
       for (auto& [output_args, grouped_node] : output_to_grouped_node) {
@@ -551,8 +529,6 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
                 break;
               }
             }
-
-            // std::cout << "node " << node_it->Name() << " has " << left_args_generated_by_group_node.size() << " left args, node_in_degreee: " << node_in_degree << std::endl;
           }
 
           if (all_input_ready) {
@@ -701,7 +677,8 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
 }
 
 // Graph name.
-const std::string& GraphViewer::Name() const noexcept {
+const std::string&
+GraphViewer::Name() const noexcept {
   return (filter_info_ == nullptr) ? graph_->Name()
                                    : filter_info_->GetMetaDef()->name;
 }
