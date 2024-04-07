@@ -117,6 +117,31 @@ struct GroupNode {
   GroupNode() {
   }
 
+  void Finalize() {
+    InlinedHashSet<const NodeArg*> intermediate_args;
+    for (const Node* node : nodes) {
+      for (const NodeArg* arg : node->InputDefs()) {
+        if (intermediate_args.find(arg) == intermediate_args.end()) {
+          input_args.push_back(arg);
+          intermediate_args.insert(arg);
+        }
+      }
+
+      for (const NodeArg* arg : node->OutputDefs()) {
+        if (intermediate_args.find(arg) == intermediate_args.end()) {
+          intermediate_args.insert(arg);
+        }
+      }
+
+      for (auto output_edge_it = node->OutputEdgesBegin(); output_edge_it != node->OutputEdgesEnd(); ++output_edge_it) {
+        const Node* output_node = &output_edge_it->GetNode();
+        if (std::find(nodes.begin(), nodes.end(), output_node) == nodes.end()) {
+          output_args.push_back(node->OutputDefs()[output_edge_it->GetSrcArgIndex()]);
+        }
+      }
+    }
+  }
+
   // GroupNode(const Node* node) {
   //   nodes.push_back(node);
   //   // priority = node->Priority();
@@ -130,16 +155,16 @@ struct GroupNode {
   //   }
   // }
 
-  GroupNode(const InlinedVector<const Node*>& nodes,
-            const InlinedVector<const NodeArg*>& input_args,
-            const InlinedVector<const NodeArg*>& output_args)
-      : nodes(nodes), input_args(input_args), output_args(output_args) {
-    // if (!nodes.empty()) {
-    //   priority = nodes[0]->Priority();
-    // }
+  // GroupNode(const InlinedVector<const Node*>& nodes,
+  //           const InlinedVector<const NodeArg*>& input_args,
+  //           const InlinedVector<const NodeArg*>& output_args)
+  //     : nodes(nodes), input_args(input_args), output_args(output_args) {
+  //   // if (!nodes.empty()) {
+  //   //   priority = nodes[0]->Priority();
+  //   // }
 
-    // single_node = nodes.size() == 1;
-  }
+  //   // single_node = nodes.size() == 1;
+  // }
 
   // bool IsSingleNode() const {
   //   return single_node;
@@ -151,12 +176,60 @@ struct GroupNode {
   InlinedVector<const NodeArg*> input_args;
   InlinedVector<const NodeArg*> output_args;
 
-  bool output_completed = false;
+  // bool output_completed = false;
   // InlinedVector<const Node*> input_edge_nodes;
   // InlinedVector<const Node*> output_consumer_nodes;
 
   // ExecutionPriority priority = ExecutionPriority::DEFAULT;
 };
+
+void handle_group_node(const Graph* graph,
+                       const NodeArg* output_arg,
+                       InlinedHashMap<const NodeArg*, GroupNode*>& output_arg_to_grouped_node,
+                       std::vector<NodeIndex>& node_orders,
+                       InlinedVector<NodeIndex>& topo_order,
+                       InlinedHashSet<const NodeArg*>& already_ready) {
+  // if (!output_arg_to_grouped_node[input_arg]->output_completed) {
+  std::cout << "handle_group_node for arg named " << output_arg->Name() << std::endl;
+
+  bool need_handle_parent_group_node = false;
+
+  if (output_arg_to_grouped_node.find(output_arg) == output_arg_to_grouped_node.end()) {
+    // Get the producer node of the output_arg.
+    const Node* producer_node = graph->GetProducerNode(output_arg->Name());
+    if (producer_node) {
+      std::cout << "producer node: " << producer_node->Name() << producer_node->OpType() << std::endl;
+    }
+
+    ORT_THROW("Group node not found for output arg: ", output_arg->Name());
+  }
+
+  for (const NodeArg* input_arg : output_arg_to_grouped_node[output_arg]->input_args) {
+    std::cout << "processing input_arg: " << input_arg->Name() << std::endl;
+    if (already_ready.find(input_arg) == already_ready.end()) {
+      need_handle_parent_group_node = true;
+      std::cout << "Need hanlde process group input arg " << input_arg->Name() << " first" << std::endl;
+      handle_group_node(graph, input_arg, output_arg_to_grouped_node, node_orders, topo_order, already_ready);
+      std::cout << "Finish process group input arg " << input_arg->Name() << std::endl;
+    }
+  }
+
+  if (!need_handle_parent_group_node) {
+    return;
+  }
+
+  for (const Node* n : output_arg_to_grouped_node[output_arg]->nodes) {
+    std::cout << "pengwa<<<" << n->Name() << std::endl;
+    node_orders.push_back(n->Index());
+    topo_order.push_back(n->Index());
+    // in_degree[n->Index()] = 0;
+  }
+
+  for (const NodeArg* output_arg : output_arg_to_grouped_node[output_arg]->output_args) {
+    std::cout << "update already_ready for output_arg: " << output_arg->Name() << std::endl;
+    already_ready.insert(output_arg);
+  }
+}
 
 GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
     : graph_{&graph},
@@ -272,6 +345,12 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
       // InlinedHashMap<const Node*, GroupedNode> node_to_grouped_node;
       InlinedVector<const Node*> branch_input_nodes;
 
+      InlinedHashSet<const NodeArg*> already_ready;
+      for (const NodeArg* initializer : GetInputsIncludingInitializers()) {
+        already_ready.insert(initializer);
+        std::cout << "update already_ready for initializer: " << initializer->Name() << std::endl;
+      }
+
       for (auto& node : Nodes()) {
         // Ignore forward.
         if (nodes_before_yieldop.find(&node) != nodes_before_yieldop.end()) {
@@ -287,28 +366,37 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
 
         size_t input_edge_count = node.GetInputEdgesCount();
         in_degree[node.Index()] = input_edge_count;
-        // input_edge_count will not be 0 any way, because it will have at least one input edge from YieldOp or forward nodes.
+        // input_edge_count could be 0 if it takes graph input directly.
 
-        // if (input_edge_count == 0) {  // A shortcut.
-        //   std::cout << "push " << node.Name() << " into branch_input_nodes" << std::endl;
-        //   branch_input_nodes.push(&node);
-        //   continue;
-        // }
+        if (input_edge_count == 0) {  // A shortcut.
+          std::cout << "push " << node.Name() << " into branch_input_nodes" << std::endl;
+          branch_input_nodes.push_back(&node);
+          continue;
+        }
 
         for (auto input_edge_it = node.InputEdgesBegin(); input_edge_it != node.InputEdgesEnd(); ++input_edge_it) {
           const Node* input_node = &input_edge_it->GetNode();
           // If the input edge connect to forward nodes, then we remove the in_degree of the node.
           if (nodes_before_yieldop.find(input_node) != nodes_before_yieldop.end()) {
             input_edge_count--;
+            already_ready.insert(node.InputDefs()[input_edge_it->GetDstArgIndex()]);
           }
         }
+
+        // if (all_input_arg_from_forward_nodes) {
+        //   branch_input_nodes.push_back(&node);
+        //   std::cout << "push " << node.Name() << " into branch_input_nodes" << std::endl;
+        //   // for (const NodeArg* input_arg : node.InputDefs()) {
+        //   //   already_ready.insert(input_arg);
+        //   // }
+        // }
 
         in_degree[node.Index()] = input_edge_count;
         if (input_edge_count == 0) {
           branch_input_nodes.push_back(&node);
           std::cout << "push " << node.Name() << " into branch_input_nodes" << std::endl;
-          // Don't append to to_visit, we will visit it later.
-          // to_visit.push(GroupNode(&node));
+          //   // Don't append to to_visit, we will visit it later.
+          //   // to_visit.push(GroupNode(&node));
         }
       }
 
@@ -380,7 +468,8 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
         }
       }
 
-      GroupNode initial_group(branch_subgraph, branch_subgraph_input_args, branch_subgraph_output_args);
+      GroupNode initial_group;
+      initial_group.nodes = branch_subgraph;
       // Print the input and output node of the branch subgraph.
       std::cout << "Branch subgraph input nodes: ";
       for (const NodeArg* arg : initial_group.input_args) {
@@ -431,100 +520,123 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
         if (output_to_grouped_node.find(associated_outputs) == output_to_grouped_node.end()) {
           output_to_grouped_node[associated_outputs] = GroupNode();
 
-          output_to_grouped_node[associated_outputs].output_args.insert(output_to_grouped_node[associated_outputs].output_args.end(),
-                                                                        associated_outputs.begin(), associated_outputs.end());
+          // output_to_grouped_node[associated_outputs].output_args.insert(output_to_grouped_node[associated_outputs].output_args.end(),
+          //                                                               associated_outputs.begin(), associated_outputs.end());
         }
 
         output_to_grouped_node[associated_outputs].nodes.push_back(node);
 
-        if (std::find(branch_input_nodes.begin(), branch_input_nodes.end(), node) != branch_input_nodes.end()) {
-          for (const NodeArg* arg : node->InputDefs()) {
-            if (std::find(output_to_grouped_node[associated_outputs].input_args.begin(),
-                          output_to_grouped_node[associated_outputs].input_args.end(), arg) ==
-                output_to_grouped_node[associated_outputs].input_args.end()) {
-              output_to_grouped_node[associated_outputs].input_args.push_back(arg);
-            }
-          }
-        }
+        // if (std::find(branch_input_nodes.begin(), branch_input_nodes.end(), node) != branch_input_nodes.end()) {
+        //   for (const NodeArg* arg : node->InputDefs()) {
+        //     if (std::find(output_to_grouped_node[associated_outputs].input_args.begin(),
+        //                   output_to_grouped_node[associated_outputs].input_args.end(), arg) ==
+        //         output_to_grouped_node[associated_outputs].input_args.end()) {
+        //       output_to_grouped_node[associated_outputs].input_args.push_back(arg);
+        //     }
+        //   }
+        // }
+      }
+
+      for (auto& [output_args, grouped_node] : output_to_grouped_node) {
+        grouped_node.Finalize();
       }
 
       // Flatten the key into NodeArg* for better search.
       InlinedHashMap<const NodeArg*, GroupNode*> output_arg_to_grouped_node;
       for (auto& [output_args, grouped_node] : output_to_grouped_node) {
-        for (const auto& output_arg : output_args) {
+        for (const auto& output_arg : grouped_node.output_args) {
           std::cout << ">>>>> output_arg: " << output_arg->Name() << " is generated by group node" << std::endl;
           output_arg_to_grouped_node[output_arg] = &grouped_node;
         }
       }
 
-      InlinedHashSet<const NodeArg*> already_ready;
       while (!to_visit.empty()) {
         const Node* current = to_visit.top();
         to_visit.pop();
 
         if (!current) continue;
 
-        if (enter) {
-          std::cout << "enter " << current->Name() << std::endl;
-          for (auto input_edge_it = current->InputEdgesBegin(); input_edge_it != current->InputEdgesEnd(); ++input_edge_it) {
-            const NodeArg* input_arg = current->InputDefs()[input_edge_it->GetDstArgIndex()];
-            if (already_ready.find(input_arg) == already_ready.end() && output_arg_to_grouped_node.find(input_arg) != output_arg_to_grouped_node.end()) {
-              if (!output_arg_to_grouped_node[input_arg]->output_completed) {
-                std::cout << "insert group node for " << input_arg->Name() << std::endl;
-                for (const Node* n : output_arg_to_grouped_node[input_arg]->nodes) {
-                  std::cout << "pengwa<<<" << n->Name() << std::endl;
-                  node_orders.push_back(n->Index());
-                  topo_order.push_back(n->Index());
-                }
-
-                for (const NodeArg* output_arg : output_arg_to_grouped_node[input_arg]->output_args) {
-                  std::cout << "update already_ready for output_arg: " << output_arg->Name() << std::endl;
-                  already_ready.insert(output_arg);
-                }
-
-                output_arg_to_grouped_node[input_arg]->output_completed = true;
-              }
-            }
-          }
-
-          enter(current);
-
-          for (const NodeArg* output_arg : current->OutputDefs()) {
-            already_ready.insert(output_arg);
+        // if (enter) {
+        std::cout << "enter " << current->Name() << std::endl;
+        for (auto input_edge_it = current->InputEdgesBegin(); input_edge_it != current->InputEdgesEnd(); ++input_edge_it) {
+          const NodeArg* output_arg = current->InputDefs()[input_edge_it->GetDstArgIndex()];
+          if (already_ready.find(output_arg) == already_ready.end() && output_arg_to_grouped_node.find(output_arg) != output_arg_to_grouped_node.end()) {
+            handle_group_node(&graph, output_arg, output_arg_to_grouped_node, node_orders, topo_order, already_ready);
           }
         }
 
+        enter(current);
+
+        for (const NodeArg* output_arg : current->OutputDefs()) {
+          already_ready.insert(output_arg);
+          std::cout << "update already_ready for output_arg: " << output_arg->Name() << std::endl;
+        }
+        // }
+
         for (auto output_edge_it = current->OutputEdgesBegin(); output_edge_it != current->OutputEdgesEnd(); ++output_edge_it) {
           const Node* node_it = &output_edge_it->GetNode();
-          auto& node_in_degree = in_degree[node_it->Index()];
-          node_in_degree--;
-
-          if (node_in_degree == 0) {
-            std::cout << "push " << node_it->Name() << " into queue" << std::endl;
-            to_visit.push(&*node_it);
-            continue;
-          }
 
           InlinedVector<const NodeArg*> left_args_generated_by_group_node;
+          bool all_input_ready = true;
+          bool all_not_ready_inputs_are_grouped = true;
           for (auto input_edge_it = node_it->InputEdgesBegin(); input_edge_it != node_it->InputEdgesEnd(); ++input_edge_it) {
             const NodeArg* input_arg = node_it->InputDefs()[input_edge_it->GetDstArgIndex()];
-            // std::cout << "loop input_arg: " << input_arg->Name() << (already_ready.find(input_arg) == already_ready.end()) << std::endl;
-            if (already_ready.find(input_arg) == already_ready.end() && output_arg_to_grouped_node.find(input_arg) != output_arg_to_grouped_node.end()) {
-              std::cout << "insert group node for " << input_arg->Name() << std::endl;
-              left_args_generated_by_group_node.push_back(input_arg);
+
+            if (already_ready.find(input_arg) == already_ready.end()) {
+              std::cout << "input_arg: " << input_arg->Name() << " is not ready" << std::endl;
+              all_input_ready = false;
+              if (output_arg_to_grouped_node.find(input_arg) != output_arg_to_grouped_node.end()) {
+                std::cout << "consider insert group node for " << input_arg->Name() << std::endl;
+                left_args_generated_by_group_node.push_back(input_arg);
+              } else {
+                std::cout << "not-ready input_arg: " << input_arg->Name() << " is not grouped" << std::endl;
+                all_not_ready_inputs_are_grouped = false;
+                break;
+              }
             }
+
+            // std::cout << "node " << node_it->Name() << " has " << left_args_generated_by_group_node.size() << " left args, node_in_degreee: " << node_in_degree << std::endl;
           }
 
-          std::cout << "node " << node_it->Name() << " has " << left_args_generated_by_group_node.size() << " left args, node_in_degreee: " << node_in_degree << std::endl;
-
-          if (node_in_degree == left_args_generated_by_group_node.size()) {
-            // for (auto& input_arg : left_args_generated_by_group_node) {
-            //   to_visit.push(output_arg_to_grouped_node[input_arg]);
-            // }
-            node_in_degree -= left_args_generated_by_group_node.size();
+          if (all_input_ready) {
+            std::cout << "push " << node_it->Name() << " into queue" << std::endl;
+            to_visit.push(&*node_it);
+          } else if (all_not_ready_inputs_are_grouped) {
             std::cout << "push " << node_it->Name() << " into queue (groupnode)" << std::endl;
             to_visit.push(&*node_it);
           }
+          // auto& node_in_degree = in_degree[node_it->Index()];
+          // node_in_degree--;
+
+          // if (node_in_degree == 0) {
+          //   std::cout << "push " << node_it->Name() << " into queue" << std::endl;
+          //   to_visit.push(&*node_it);
+          //   continue;
+          // }
+
+          // InlinedVector<const NodeArg*> left_args_generated_by_group_node;
+
+          // for (auto input_edge_it = node_it->InputEdgesBegin(); input_edge_it != node_it->InputEdgesEnd(); ++input_edge_it) {
+          //   const NodeArg* input_arg = node_it->InputDefs()[input_edge_it->GetDstArgIndex()];
+          //   // std::cout << "loop input_arg: " << input_arg->Name() << (already_ready.find(input_arg) == already_ready.end()) << std::endl;
+          //   if (already_ready.find(input_arg) == already_ready.end()) {
+          //     if (output_arg_to_grouped_node.find(input_arg) != output_arg_to_grouped_node.end()) {
+          //       std::cout << "insert group node for " << input_arg->Name() << std::endl;
+          //       left_args_generated_by_group_node.push_back(input_arg);
+          //     }
+          //   } else {
+          //   }
+
+          //   std::cout << "node " << node_it->Name() << " has " << left_args_generated_by_group_node.size() << " left args, node_in_degreee: " << node_in_degree << std::endl;
+
+          //   if (node_in_degree == left_args_generated_by_group_node.size()) {
+          //     // for (auto& input_arg : left_args_generated_by_group_node) {
+          //     //   to_visit.push(output_arg_to_grouped_node[input_arg]);
+          //     // }
+          //     node_in_degree -= left_args_generated_by_group_node.size();
+          //     std::cout << "push " << node_it->Name() << " into queue (groupnode)" << std::endl;
+          //     to_visit.push(&*node_it);
+          //   }
         }
 
         topo_order.push_back(current->Index());
