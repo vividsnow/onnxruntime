@@ -285,6 +285,20 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
         },
         NodeCompare());
 
+    std::vector<NodeIndex> updated_node_orders = node_orders;
+    // Considering the foward node + Shape/Size is enough.
+    for (const NodeIndex& node_index : shape_size_nodes) {
+      for (auto& parent : shape_size_parents[node_index]) {
+        auto it = std::find(updated_node_orders.begin(), updated_node_orders.end(), parent);
+        if (it != updated_node_orders.end()) {
+          updated_node_orders.insert(it + 1, node_index);
+          nodes_before_yieldop.insert(graph.GetNode(node_index));
+        }
+      }
+    }
+
+    node_orders = std::move(updated_node_orders);
+
     auto sort = [this, &nodes_before_yieldop, &backward_input_nodes, &graph](
                     const std::function<void(const Node*)>& enter,
                     const std::function<bool(const Node*, const Node*)>& comp,
