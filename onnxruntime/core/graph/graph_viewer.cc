@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <queue>
+
 #include "core/graph/graph_viewer.h"
 #include "core/graph/indexed_sub_graph.h"
 
@@ -112,12 +114,20 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph& filter_info)
 }
 
 struct GroupNode {
+  GroupNode() {
+  }
+
   GroupNode(const Node* node) {
     nodes.push_back(node);
     // priority = node->Priority();
-    single_node = true;
-    input_args = node->InputDefs();
-    output_args = node->OutputDefs();
+    // single_node = true;
+    for (const NodeArg* arg : node->InputDefs()) {
+      input_args.push_back(arg);
+    }
+
+    for (const NodeArg* arg : node->OutputDefs()) {
+      output_args.push_back(arg);
+    }
   }
 
   GroupNode(const InlinedVector<const Node*>& nodes,
@@ -128,14 +138,14 @@ struct GroupNode {
     //   priority = nodes[0]->Priority();
     // }
 
-    single_node = nodes.size() == 1;
+    // single_node = nodes.size() == 1;
   }
 
-  bool IsSingleNode() const {
-    return single_node;
-  }
+  // bool IsSingleNode() const {
+  //   return single_node;
+  // }
 
-  bool single_node = true;
+  // bool single_node = true;
 
   InlinedVector<const Node*> nodes;
   InlinedVector<const NodeArg*> input_args;
@@ -234,7 +244,7 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
   InlinedHashMap<const Node*, InlinedVector<const Node*>> branch_subgraphs;
 
   if (yield_node) {
-    InlinedVector<NodeIndex> node_orders;
+    std::vector<NodeIndex> node_orders;
     InlinedHashSet<const Node*> nodes_before_yieldop;
 
     // Reverse DFS from forward output nodes to find all "forward" nodes.
@@ -242,7 +252,7 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
     graph.ReverseDFSFrom(
         forward_output_nodes,
         nullptr,
-        [&nodes_before_yieldop](const Node* n) {
+        [&nodes_before_yieldop, &node_orders](const Node* n) {
           nodes_before_yieldop.insert(n);
           node_orders.push_back(n->Index());
         },
@@ -250,11 +260,11 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
 
     node_orders.push_back(yield_node->Index());
 
-    auto sort = [&nodes_before_yieldop, &backward_input_nodes](
+    auto sort = [this, &nodes_before_yieldop, &backward_input_nodes, &graph](
                     const std::function<void(const Node*)>& enter,
                     const std::function<bool(const Node*, const Node*)>& comp,
-                    InlinedVector<NodeIndex>& node_orders) {
-      auto number_of_nodes = NumberOfNodes() - node_orders.size();
+                    std::vector<NodeIndex>& node_orders) {
+      size_t number_of_nodes = NumberOfNodes() - node_orders.size();
       InlinedVector<size_t> in_degree(MaxNodeIndex(), 0);
       InlinedVector<NodeIndex> topo_order;
       topo_order.reserve(number_of_nodes);
@@ -271,7 +281,7 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
         size_t input_edge_count = node.GetInputEdgesCount();
         in_degree[node.Index()] = input_edge_count;
         if (input_edge_count == 0) {  // A shortcut.
-          to_visit.push(GroupNode(&node));
+          to_visit.push(&node);
           continue;
         }
 
@@ -290,6 +300,7 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
         }
       }
 
+      InlinedHashMap<const NodeArg*, GroupNode*> output_arg_to_grouped_node;
       // Loop through the branch_input_nodes to find the branch subgraphs by its output edges in BFS,
       // and find the maximum self_contained subgraph taking the branch_input_nodes as input nodes.
       {
@@ -307,7 +318,7 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
         // visited.insert(branch_input_node);
 
         while (!to_visit.empty()) {
-          const Node* current = to_visit.top();
+          const Node* current = to_visit.front();
           to_visit.pop();
 
           if (!current) continue;
@@ -336,9 +347,9 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
         InlinedVector<const NodeArg*> branch_subgraph_output_args;
         for (const Node* n : branch_subgraph) {
           for (auto output_it = n->OutputEdgesBegin(); output_it != n->OutputEdgesEnd(); ++output_it) {
-            const Node* output_node = output_it->GetNode();
+            const Node* output_node = &output_it->GetNode();
             const size_t dest_in_port = output_it->GetDstArgIndex();
-            if (branch_subgraph.find(output_node) == branch_subgraph.end()) {
+            if (std::find(branch_subgraph.begin(), branch_subgraph.end(), output_node) == branch_subgraph.end()) {
               branch_subgraph_consumers.push_back({output_node, dest_in_port});
               if (std::find(branch_subgraph_output_args.begin(), branch_subgraph_output_args.end(),
                             output_node->InputDefs()[dest_in_port]) == branch_subgraph_output_args.end()) {
@@ -366,9 +377,10 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
         InlinedHashMap<const Node*, std::set<const NodeArg*>> node_to_its_associated_outputs;
         for (const auto& consumer : branch_subgraph_consumers) {
           const NodeArg* output_arg = consumer.first->InputDefs()[consumer.second];
-          const Node* end_node = GetProducerNode(output_arg);
+          const Node* end_node = GetProducerNode(output_arg->Name());
+          InlinedVector<const Node*> end_nodes{end_node};
           graph.ReverseDFSFrom(
-              {end_node},
+              end_nodes,
               nullptr,
               [&node_to_its_associated_outputs, &output_arg](const Node* n) {
                 node_to_its_associated_outputs[n].insert(output_arg);
@@ -377,13 +389,14 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
         }
 
         // Cluster the nodes in the branch_subgraph based on the associated outputs.
-        InlinedHashMap<std::set<std::string>, GroupNode> output_to_grouped_node;
+        InlinedHashMap<std::set<const NodeArg*>, GroupNode> output_to_grouped_node;
 
         for (const auto& node : branch_subgraph) {
           const auto& associated_outputs = node_to_its_associated_outputs[node];
+
           output_to_grouped_node[associated_outputs].nodes.push_back(node);
 
-          if (branch_input_nodes.find(node) != branch_input_nodes.end()) {
+          if (std::find(branch_input_nodes.begin(), branch_input_nodes.end(), node) != branch_input_nodes.end()) {
             output_to_grouped_node[associated_outputs].input_args.insert(output_to_grouped_node[associated_outputs].input_args.end(),
                                                                          node->InputDefs().begin(), node->InputDefs().end());
           }
@@ -437,7 +450,7 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
             continue;
           }
 
-          InlineVector<const NodeArg*> left_args_generated_by_group_node;
+          InlinedVector<const NodeArg*> left_args_generated_by_group_node;
           for (auto input_edge_it = node_it->InputEdgesBegin(); input_edge_it != node_it->InputEdgesEnd(); ++input_edge_it) {
             const NodeArg* input_arg = node_it->InputDefs()[input_edge_it->GetDstArgIndex()];
             if (already_ready.find(input_arg) == already_ready.end() && output_arg_to_grouped_node.find(input_arg) != output_arg_to_grouped_node.end()) {
@@ -455,15 +468,15 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
         topo_order.push_back(current->Index());
       }
 
-      if (number_of_nodes != static_cast<int>(topo_order.size())) {
+      if (number_of_nodes != topo_order.size()) {
         ORT_THROW("Some nodes are not included in the topological sort, graph have a cycle.");
       }
     };
 
-    sort([&node_orders](const Node* n) -> void { node_orders.push_back(n->Index()); }, PriorityGroupedNodesCompare(), node_orders);
+    sort([&node_orders](const Node* n) -> void { node_orders.push_back(n->Index()); }, PriorityNodeCompare(), node_orders);
 
     nodes_in_topological_order_with_priority_ = node_orders;
-    ORT_ENFORCE(nodes_in_topological_order_with_priority_.size() == NumberOfNodes());
+    ORT_ENFORCE(nodes_in_topological_order_with_priority_.size() == static_cast<size_t>(NumberOfNodes()));
   } else {
     graph.KahnsTopologicalSort(
         [this](const Node* n) {

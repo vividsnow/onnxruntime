@@ -1818,23 +1818,6 @@ void Graph::ReverseDFSFrom(gsl::span<const Node* const> from,
   }
 }
 
-template <typename T>
-struct VisitorPriorityQueue {
-  using ComparatorType = std::function<bool(T, T)>;
-  std::list<T> list_;
-  const ComparatorType comparator_ = nullptr;
-  VisitorPriorityQueue(const ComparatorType& comp) : comparator_(comp) {}
-
-  void push(T node) {
-    list_.insert(
-        std::upper_bound(list_.begin(), list_.end(), node, comparator_),
-        node);
-  }
-  bool empty() { return list_.empty(); }
-  T top() { return list_.back(); }
-  void pop() { list_.pop_back(); }
-};
-
 #if !defined(ORT_MINIMAL_BUILD)
 void Graph::KahnsTopologicalSort(const std::function<void(const Node*)>& enter,
                                  const std::function<bool(const Node*, const Node*)>& comp) const {
