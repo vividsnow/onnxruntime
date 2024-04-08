@@ -192,6 +192,7 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
 
   if (yield_node) {
     std::vector<NodeIndex> node_orders;
+    node_orders.reserve(NumberOfNodes());
     graph.MemoryEfficientTopologicalSort(
         forward_output_nodes,
         shape_size_parents,
