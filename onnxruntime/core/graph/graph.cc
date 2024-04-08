@@ -1869,29 +1869,31 @@ struct GroupNode {
   }
 
   void Finalize() {
-    // InlinedHashSet<const NodeArg*> intermediate_args;
-    std::cout << "Finalize :" << std::endl;
+    InlinedHashSet<const NodeArg*> intermediate_args;
+    // std::cout << "Finalize :" << std::endl;
     for (const Node* node : nodes) {
       for (const NodeArg* arg : node->InputDefs()) {
-        if (std::find(output_args.begin(), output_args.end(), arg) == output_args.end()) {
+        if (intermediate_args.find(arg) == intermediate_args.end()) {
           input_args.push_back(arg);
-          std::cout << "input_args  " << arg->Name() << std::endl;
+          // std::cout << "input_args  " << arg->Name() << std::endl;
         }
       }
 
       for (const NodeArg* arg : node->OutputDefs()) {
-        if (std::find(output_args.begin(), output_args.end(), arg) == output_args.end()) {
-          output_args.push_back(arg);
-          std::cout << "output_args  " << arg->Name() << std::endl;
-        }
+        // if (std::find(output_args.begin(), output_args.end(), arg) == output_args.end()) {
+        intermediate_args.insert(arg);
+        // std::cout << "output_args  " << arg->Name() << std::endl;
+        // }
       }
 
-      // for (auto output_edge_it = node->OutputEdgesBegin(); output_edge_it != node->OutputEdgesEnd(); ++output_edge_it) {
-      //   const Node* output_node = &output_edge_it->GetNode();
-      //   if (std::find(nodes.begin(), nodes.end(), output_node) == nodes.end()) {
-      //     output_args.push_back(node->OutputDefs()[output_edge_it->GetSrcArgIndex()]);
-      //   }
-      // }
+      for (auto output_edge_it = node->OutputEdgesBegin(); output_edge_it != node->OutputEdgesEnd(); ++output_edge_it) {
+        const Node* output_node = &output_edge_it->GetNode();
+        // Only if the output arg is used by nodes outside the group, then it is an output arg.
+        if (std::find(nodes.begin(), nodes.end(), output_node) == nodes.end()) {
+          output_args.push_back(node->OutputDefs()[output_edge_it->GetSrcArgIndex()]);
+          // std::cout << "!!!!!output_args  " << node->OutputDefs()[output_edge_it->GetSrcArgIndex()]->Name() << std::endl;
+        }
+      }
     }
   }
 
@@ -1922,11 +1924,6 @@ void SortForwardNodesByReverseDFS(const Graph* graph,
         node_orders.push_back(n->Index());
       },
       NodeCompare());
-
-  if (shape_size_parents.empty()) {
-    std::cout << "[Tune Shape|Size] shape_size_parents is empty" << std::endl;
-    return;
-  }
 
   for (const auto& parent_to_children_pair : shape_size_parents) {
     const NodeIndex& parent_index = parent_to_children_pair.first;
@@ -2028,30 +2025,15 @@ void FindSelfContainedGraphFromBranchInputLeafNodes(const InlinedVector<const No
 
   // At this point, branch_subgraph is a big subgraph that contains all the nodes that are purely
   // triggered by the branch_input_nodes, other graph input/initializers and leaf nodes (for example Constant).
-  // InlinedVector<const NodeArg*> branch_subgraph_output_args;
   for (const Node* n : branch_subgraph) {
     for (auto output_it = n->OutputEdgesBegin(); output_it != n->OutputEdgesEnd(); ++output_it) {
       const Node* output_node = &output_it->GetNode();
       const size_t dest_in_port = output_it->GetDstArgIndex();
       if (std::find(branch_subgraph.begin(), branch_subgraph.end(), output_node) == branch_subgraph.end()) {
         branch_subgraph_consumers.push_back({output_node, dest_in_port});
-        // if (std::find(branch_subgraph_output_args.begin(), branch_subgraph_output_args.end(),
-        //               output_node->InputDefs()[dest_in_port]) == branch_subgraph_output_args.end()) {
-        //   branch_subgraph_output_args.push_back(output_node->InputDefs()[dest_in_port]);
-        // }
       }
     }
   }
-
-  // InlinedVector<const NodeArg*> branch_subgraph_input_args;
-  // for (const Node* n : branch_subgraph) {
-  //   for (const NodeArg* input_arg : n->InputDefs()) {
-  //     if (std::find(branch_subgraph_output_args.begin(), branch_subgraph_output_args.end(), input_arg) ==
-  //         branch_subgraph_output_args.end()) {
-  //       branch_subgraph_input_args.push_back(input_arg);
-  //     }
-  //   }
-  // }
 }
 
 void TagNodeToAssociatedOutputs(const Graph* graph,
@@ -2090,7 +2072,6 @@ void TagNodeToAssociatedOutputs(const Graph* graph,
   }
 
   // Cluster the nodes in the branch_subgraph based on the associated outputs.
-
   for (const auto& node : branch_subgraph) {
     const auto& associated_outputs = node_to_its_associated_outputs[node];
 
@@ -2115,23 +2096,18 @@ void TagNodeToAssociatedOutputs(const Graph* graph,
   }
 }
 
-// void UpdateBackwardInDegree(const Graph* graph,
-//                             const InlinedHashSet<const Node*>& nodes_to_execute_before_yieldop,
-//                             InlinedVector<const Node*>& branch_input_nodes,
-//                             InlinedVector<size_t>& backward_node_in_degree,
-//                             VisitorPriorityQueue<const Node*>& to_visit,
-//                             InlinedHashSet<const NodeArg*>& already_ready,
-//                             InlinedVector<std::pair<const Node*, size_t>>& branch_subgraph_consumers) {
-//   // For each GroupNode, its execution is non-blocking main critical path rooting from YieldOp.
-//   // The only dependencies of a GroupNode is either graph input/initializer/forward nodes, or
-//   // the output nodes of another GroupNode.
-//   // So we treat those GroupNode(s) as a single unit that can be executed anytime when it is
-//   // firstly needed by the main critipath path.
-//   for (auto& [output_node, dest_in_port] : branch_subgraph_consumers) {
-//     ENFORCE(backward_node_in_degree[output_node->Index()] > 0);
-//     backward_node_in_degree[output_node->Index()]--;
-//   }
-// }
+void UpdateBackwardInDegree(InlinedVector<size_t>& backward_node_in_degree,
+                            InlinedVector<std::pair<const Node*, size_t>>& branch_subgraph_consumers) {
+  // For each GroupNode, its execution is non-blocking main critical path rooting from YieldOp.
+  // The only dependencies of a GroupNode is either graph input/initializer/forward nodes, or
+  // the output nodes of another GroupNode.
+  // So we treat those GroupNode(s) as a single unit that can be executed anytime when it is
+  // firstly needed by the main critipath path.
+  for (auto& [output_node, dest_in_port] : branch_subgraph_consumers) {
+    ORT_ENFORCE(backward_node_in_degree[output_node->Index()] > 0);
+    backward_node_in_degree[output_node->Index()]--;
+  }
+}
 
 void OutputGroupedNodes(const Graph* graph,
                         const NodeArg* output_arg,
@@ -2139,29 +2115,28 @@ void OutputGroupedNodes(const Graph* graph,
                         std::vector<NodeIndex>& node_orders,
                         InlinedVector<NodeIndex>& topo_order,
                         InlinedHashSet<const NodeArg*>& already_ready) {
-  std::cout << "OutputGroupedNodes for arg named " << output_arg->Name() << std::endl;
+  // std::cout << "OutputGroupedNodes for arg named " << output_arg->Name() << std::endl;
 
   ORT_ENFORCE(output_arg_to_grouped_node.find(output_arg) != output_arg_to_grouped_node.end(),
               "output_arg_to_grouped_node does not contain output_arg named ", output_arg->Name());
 
   for (const NodeArg* input_arg : output_arg_to_grouped_node[output_arg]->input_args) {
-    std::cout << "processing input_arg: " << input_arg->Name() << std::endl;
+    // std::cout << "processing input_arg: " << input_arg->Name() << std::endl;
     if (already_ready.find(input_arg) == already_ready.end()) {
-      std::cout << "Need hanlde process group input arg " << input_arg->Name() << " first" << std::endl;
+      // std::cout << "Need hanlde process group input arg " << input_arg->Name() << " first" << std::endl;
       OutputGroupedNodes(graph, input_arg, output_arg_to_grouped_node, node_orders, topo_order, already_ready);
-      std::cout << "Finish process group input arg " << input_arg->Name() << std::endl;
+      // std::cout << "Finish process group input arg " << input_arg->Name() << std::endl;
     }
   }
 
   for (const Node* n : output_arg_to_grouped_node[output_arg]->nodes) {
-    std::cout << "pengwa<<<" << n->Name() << std::endl;
+    // std::cout << "pengwa<<<" << n->Name() << std::endl;
     node_orders.push_back(n->Index());
     topo_order.push_back(n->Index());
-    // in_degree[n->Index()] = 0;
   }
 
   for (const NodeArg* output_arg : output_arg_to_grouped_node[output_arg]->output_args) {
-    std::cout << "update already_ready for output_arg: " << output_arg->Name() << std::endl;
+    // std::cout << "update already_ready for output_arg: " << output_arg->Name() << std::endl;
     already_ready.insert(output_arg);
   }
 }
@@ -2174,13 +2149,13 @@ void Graph::MemoryEfficientTopologicalSort(
     const std::function<bool(const Node*, const Node*)>& comp,
     std::vector<NodeIndex>& node_orders) const {
   /// Firstly, sort the forward nodes with customized ReverseDFS.
+
+  // Create a hash map (paired with node_orders) for cheaper search.
   InlinedHashSet<const Node*> nodes_to_execute_before_yieldop;
-  std::cout << "Start forward nodes sort" << std::endl;
   SortForwardNodesByReverseDFS(this, forward_output_nodes,
                                shape_size_parents,
                                nodes_to_execute_before_yieldop,
                                node_orders);
-  std::cout << "Complte forward nodes sort" << std::endl;
 
   /// Secondly, sort the backward nodes with customized Kahn's algorithm.
 
@@ -2200,12 +2175,12 @@ void Graph::MemoryEfficientTopologicalSort(
   InlinedHashSet<const NodeArg*> already_ready;
   for (const NodeArg* input : GetInputsIncludingInitializers()) {
     already_ready.insert(input);
-    std::cout << "update already_ready for input: " << input->Name() << std::endl;
+    // std::cout << "update already_ready for input: " << input->Name() << std::endl;
   }
 
   for (auto& [name, tensor] : GetAllInitializedTensors()) {
     already_ready.insert(GetNodeArg(name));
-    std::cout << "update already_ready for initializer: " << name << std::endl;
+    // std::cout << "update already_ready for initializer: " << name << std::endl;
   }
 
   InlinedVector<const Node*> branch_input_nodes;
@@ -2219,13 +2194,15 @@ void Graph::MemoryEfficientTopologicalSort(
   InlinedHashMap<const NodeArg*, GroupNode*> output_arg_to_grouped_node;
   TagNodeToAssociatedOutputs(this, nodes_to_execute_before_yieldop, branch_subgraph_consumers, branch_subgraph, output_to_grouped_node, output_arg_to_grouped_node);
 
+  UpdateBackwardInDegree(backward_node_in_degree, branch_subgraph_consumers);
+
   while (!to_visit.empty()) {
     const Node* current = to_visit.top();
     to_visit.pop();
 
     if (!current) continue;
 
-    std::cout << "enter " << current->Name() << std::endl;
+    // std::cout << "enter " << current->Name() << std::endl;
     for (auto input_edge_it = current->InputEdgesBegin(); input_edge_it != current->InputEdgesEnd(); ++input_edge_it) {
       const NodeArg* output_arg = current->InputDefs()[input_edge_it->GetDstArgIndex()];
       if (already_ready.find(output_arg) == already_ready.end() && output_arg_to_grouped_node.find(output_arg) != output_arg_to_grouped_node.end()) {
@@ -2234,41 +2211,20 @@ void Graph::MemoryEfficientTopologicalSort(
     }
 
     node_orders.push_back(current->Index());
-    std::cout << "pengwa<<<<" << current->Name() << std::endl;
+    // std::cout << "pengwa<<<<" << current->Name() << std::endl;
 
     for (const NodeArg* output_arg : current->OutputDefs()) {
       already_ready.insert(output_arg);
-      std::cout << "update already_ready for output_arg: " << output_arg->Name() << std::endl;
+      // std::cout << "update already_ready for output_arg: " << output_arg->Name() << std::endl;
     }
 
     for (auto output_edge_it = current->OutputEdgesBegin(); output_edge_it != current->OutputEdgesEnd(); ++output_edge_it) {
       const Node* node_it = &output_edge_it->GetNode();
 
-      InlinedVector<const NodeArg*> left_args_generated_by_group_node;
-      bool all_input_ready = true;
-      bool all_not_ready_inputs_are_grouped = true;
-      for (auto input_edge_it = node_it->InputEdgesBegin(); input_edge_it != node_it->InputEdgesEnd(); ++input_edge_it) {
-        const NodeArg* input_arg = node_it->InputDefs()[input_edge_it->GetDstArgIndex()];
+      auto& node_in_degree = backward_node_in_degree[node_it->Index()];
+      node_in_degree--;
 
-        if (already_ready.find(input_arg) == already_ready.end()) {
-          std::cout << "input_arg: " << input_arg->Name() << " is not ready" << std::endl;
-          all_input_ready = false;
-          if (output_arg_to_grouped_node.find(input_arg) != output_arg_to_grouped_node.end()) {
-            std::cout << "consider insert group node for " << input_arg->Name() << std::endl;
-            left_args_generated_by_group_node.push_back(input_arg);
-          } else {
-            std::cout << "not-ready input_arg: " << input_arg->Name() << " is not grouped" << std::endl;
-            all_not_ready_inputs_are_grouped = false;
-            break;
-          }
-        }
-      }
-
-      if (all_input_ready) {
-        std::cout << "push " << node_it->Name() << " into queue" << std::endl;
-        to_visit.push(&*node_it);
-      } else if (all_not_ready_inputs_are_grouped) {
-        std::cout << "push " << node_it->Name() << " into queue (groupnode)" << std::endl;
+      if (node_in_degree == 0) {
         to_visit.push(&*node_it);
       }
     }
