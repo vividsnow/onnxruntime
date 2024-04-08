@@ -194,7 +194,6 @@ GraphViewer::GraphViewer(const Graph& graph, const IndexedSubGraph* filter_info)
     std::vector<NodeIndex> node_orders;
     graph.MemoryEfficientTopologicalSort(
         forward_output_nodes,
-        shape_size_nodes,
         shape_size_parents,
         PriorityNodeCompare(),
         node_orders);

@@ -1904,7 +1904,6 @@ struct GroupNode {
 
 void SortForwardNodesByReverseDFS(const Graph* graph,
                                   const InlinedVector<const Node*>& forward_output_nodes,
-                                  const InlinedHashSet<NodeIndex>& shape_size_nodes,
                                   const InlinedHashMap<NodeIndex, InlinedVector<NodeIndex>>& shape_size_parents,
                                   InlinedHashSet<const Node*>& nodes_to_execute_before_yieldop,
                                   std::vector<NodeIndex>& node_orders) {
@@ -1925,22 +1924,26 @@ void SortForwardNodesByReverseDFS(const Graph* graph,
       NodeCompare());
 
   if (shape_size_parents.empty()) {
+    std::cout << "[Tune Shape|Size] shape_size_parents is empty" << std::endl;
     return;
   }
 
-  // Considering the foward node + Shape/Size is enough.
-  for (const NodeIndex& node_index : shape_size_nodes) {
-    if (shape_size_parents.count(node_index) == 0) {
+  for (const auto& parent_to_children_pair : shape_size_parents) {
+    const NodeIndex& parent_index = parent_to_children_pair.first;
+    auto it = std::find(node_orders.begin(), node_orders.end(), parent_index);
+    if (it == node_orders.end()) {
       continue;
     }
 
-    for (auto& parent : shape_size_parents.at(node_index)) {
-      auto it = std::find(node_orders.begin(), node_orders.end(), parent);
-      if (it != node_orders.end()) {
-        std::cout << "[Tune Shape|Size] insert " << node_index << " before " << parent << std::endl;
-        node_orders.insert(it + 1, node_index);
-        nodes_to_execute_before_yieldop.insert(graph->GetNode(node_index));
+    for (const NodeIndex& shape_size_node_index : parent_to_children_pair.second) {
+      const Node* shape_size_node = graph->GetNode(shape_size_node_index);
+      // If the Shape/Size is already in the node_orders, then skip it.
+      if (nodes_to_execute_before_yieldop.find(shape_size_node) != nodes_to_execute_before_yieldop.end()) {
+        continue;
       }
+      std::cout << "[Tune Shape|Size] insert " << shape_size_node_index << " before " << parent_index << std::endl;
+      node_orders.insert(it + 1, shape_size_node_index);
+      nodes_to_execute_before_yieldop.insert(shape_size_node);
     }
   }
 }
@@ -1998,7 +2001,6 @@ void FindSelfContainedGraphFromBranchInputLeafNodes(const InlinedVector<const No
   // Loop through the branch_input_nodes to find the branch subgraphs by its output edges in BFS,
   // and find the maximum self_contained subgraph taking the branch_input_nodes as input nodes.
   std::queue<const Node*> to_visit_queue;
-  InlinedHashSet<const NodeArg*> branch_trigger_node_args;
   InlinedVector<size_t> in_degree_copy = backward_node_in_degree;
 
   // Add all nodes in branch_input_nodes to the queue
@@ -2006,8 +2008,6 @@ void FindSelfContainedGraphFromBranchInputLeafNodes(const InlinedVector<const No
     to_visit_queue.push(branch_input_node);
     branch_subgraph.push_back(branch_input_node);
   }
-  // to_visit.push(branch_input_node);
-  // visited.insert(branch_input_node);
 
   while (!to_visit_queue.empty()) {
     const Node* current = to_visit_queue.front();
@@ -2022,40 +2022,36 @@ void FindSelfContainedGraphFromBranchInputLeafNodes(const InlinedVector<const No
       if (node_in_degree == 0) {
         to_visit_queue.push(&*node_it);
         branch_subgraph.push_back(&*node_it);
-        for (const NodeArg* output_arg : node_it->OutputDefs()) {
-          branch_trigger_node_args.insert(output_arg);
-        }
       }
     }
   }
 
-  // At this point, branch_subgraph is a bigger subgraph that contains all the nodes that are purely
-  // triggered by the branch_input_nodes.
-
-  InlinedVector<const NodeArg*> branch_subgraph_output_args;
+  // At this point, branch_subgraph is a big subgraph that contains all the nodes that are purely
+  // triggered by the branch_input_nodes, other graph input/initializers and leaf nodes (for example Constant).
+  // InlinedVector<const NodeArg*> branch_subgraph_output_args;
   for (const Node* n : branch_subgraph) {
     for (auto output_it = n->OutputEdgesBegin(); output_it != n->OutputEdgesEnd(); ++output_it) {
       const Node* output_node = &output_it->GetNode();
       const size_t dest_in_port = output_it->GetDstArgIndex();
       if (std::find(branch_subgraph.begin(), branch_subgraph.end(), output_node) == branch_subgraph.end()) {
         branch_subgraph_consumers.push_back({output_node, dest_in_port});
-        if (std::find(branch_subgraph_output_args.begin(), branch_subgraph_output_args.end(),
-                      output_node->InputDefs()[dest_in_port]) == branch_subgraph_output_args.end()) {
-          branch_subgraph_output_args.push_back(output_node->InputDefs()[dest_in_port]);
-        }
+        // if (std::find(branch_subgraph_output_args.begin(), branch_subgraph_output_args.end(),
+        //               output_node->InputDefs()[dest_in_port]) == branch_subgraph_output_args.end()) {
+        //   branch_subgraph_output_args.push_back(output_node->InputDefs()[dest_in_port]);
+        // }
       }
     }
   }
 
-  InlinedVector<const NodeArg*> branch_subgraph_input_args;
-  for (const Node* n : branch_subgraph) {
-    for (const NodeArg* input_arg : n->InputDefs()) {
-      if (std::find(branch_subgraph_output_args.begin(), branch_subgraph_output_args.end(), input_arg) ==
-          branch_subgraph_output_args.end()) {
-        branch_subgraph_input_args.push_back(input_arg);
-      }
-    }
-  }
+  // InlinedVector<const NodeArg*> branch_subgraph_input_args;
+  // for (const Node* n : branch_subgraph) {
+  //   for (const NodeArg* input_arg : n->InputDefs()) {
+  //     if (std::find(branch_subgraph_output_args.begin(), branch_subgraph_output_args.end(), input_arg) ==
+  //         branch_subgraph_output_args.end()) {
+  //       branch_subgraph_input_args.push_back(input_arg);
+  //     }
+  //   }
+  // }
 }
 
 void TagNodeToAssociatedOutputs(const Graph* graph,
@@ -2174,15 +2170,15 @@ void OutputGroupedNodes(const Graph* graph,
 
 void Graph::MemoryEfficientTopologicalSort(
     const InlinedVector<const Node*>& forward_output_nodes,
-    const InlinedHashSet<NodeIndex>& shape_size_nodes,
     const InlinedHashMap<NodeIndex, InlinedVector<NodeIndex>>& shape_size_parents,
     const std::function<bool(const Node*, const Node*)>& comp,
     std::vector<NodeIndex>& node_orders) const {
   /// Firstly, sort the forward nodes with customized ReverseDFS.
   InlinedHashSet<const Node*> nodes_to_execute_before_yieldop;
   std::cout << "Start forward nodes sort" << std::endl;
-  SortForwardNodesByReverseDFS(this, forward_output_nodes, shape_size_nodes,
-                               shape_size_parents, nodes_to_execute_before_yieldop,
+  SortForwardNodesByReverseDFS(this, forward_output_nodes,
+                               shape_size_parents,
+                               nodes_to_execute_before_yieldop,
                                node_orders);
   std::cout << "Complte forward nodes sort" << std::endl;
 
@@ -2200,8 +2196,6 @@ void Graph::MemoryEfficientTopologicalSort(
   InlinedVector<NodeIndex> topo_order;
   topo_order.reserve(number_of_nodes);
   VisitorPriorityQueue<const Node*> to_visit(comp);
-  // InlinedHashMap<const Node*, GroupedNode> node_to_grouped_node;
-  InlinedVector<const Node*> branch_input_nodes;
 
   InlinedHashSet<const NodeArg*> already_ready;
   for (const NodeArg* input : GetInputsIncludingInitializers()) {
@@ -2214,6 +2208,7 @@ void Graph::MemoryEfficientTopologicalSort(
     std::cout << "update already_ready for initializer: " << name << std::endl;
   }
 
+  InlinedVector<const Node*> branch_input_nodes;
   PrepareBranchSubgraphDetection(this, nodes_to_execute_before_yieldop, branch_input_nodes, backward_node_in_degree, to_visit, already_ready);
   InlinedVector<const Node*> branch_subgraph;
   InlinedVector<std::pair<const Node*, size_t>> branch_subgraph_consumers;
@@ -2245,7 +2240,6 @@ void Graph::MemoryEfficientTopologicalSort(
       already_ready.insert(output_arg);
       std::cout << "update already_ready for output_arg: " << output_arg->Name() << std::endl;
     }
-    // }
 
     for (auto output_edge_it = current->OutputEdgesBegin(); output_edge_it != current->OutputEdgesEnd(); ++output_edge_it) {
       const Node* node_it = &output_edge_it->GetNode();
