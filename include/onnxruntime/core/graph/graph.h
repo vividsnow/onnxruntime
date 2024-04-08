@@ -1085,6 +1085,12 @@ class Graph {  // NOLINT(clang-analyzer-optin.performance.Padding): preserve exi
   void KahnsTopologicalSort(const std::function<void(const Node*)>& enter,
                             const std::function<bool(const Node*, const Node*)>& comp) const;
 
+  void MemoryEfficientTopologicalSort(const InlinedVector<const Node*>& forward_output_nodes,
+                                      const InlinedHashSet<NodeIndex>& shape_size_nodes,
+                                      const InlinedHashMap<NodeIndex, InlinedVector<NodeIndex>>& shape_size_parents,
+                                      const std::function<bool(const Node*, const Node*)>& comp,
+                                      std::vector<NodeIndex>& node_orders) const;
+
 #endif
 
   /** Gets the map of operator domains to their opset versions. */
