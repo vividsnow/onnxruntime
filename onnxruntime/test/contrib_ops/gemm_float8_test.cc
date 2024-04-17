@@ -149,6 +149,9 @@ void TestGemmFloat8WithFloat8(int64_t dtype, bool trans_a = false, bool trans_b 
     GTEST_SKIP_("Hardware NOT support Matrix Multiplication for FLOAT8");
   }
 #endif
+#if defined(USE_ROCM) && #defined(USE_COMPOSABLE_KERNEL)
+    GTEST_SKIP_("GemmFloat8 on AMD hardware requires to build with USE_COMPOSABLE_KERNEL");
+#endif
   int m = 16;
   int n = 32;
   int k = 16;
